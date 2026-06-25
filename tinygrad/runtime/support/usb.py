@@ -280,7 +280,17 @@ class CustomASM24Controller:
     result = b''
     for off in range(0, length, 0xFF):
       chunk = min(0xFF, length - off)
-      ret = libusb.libusb_control_transfer(self.usb.handle, 0xC0, 0xE4, base_addr + off, 0, self._f0_out_buf, chunk, 1000)
+      # retry on LIBUSB_ERROR_IO (-1)
+      for attempt in range(5):
+        ret = libusb.libusb_control_transfer(self.usb.handle, 0xC0, 0xE4, base_addr + off, 0, self._f0_out_buf, chunk, 1000)
+        if ret == chunk:
+          break
+        try:
+          from openpilot.common.swaglog import cloudlog
+          cloudlog.warning(f"usb read retry: addr=0x{base_addr + off:04X} ret={ret} attempt={attempt+1}/5")
+        except Exception:
+          pass
+        time.sleep(0.01 * (attempt + 1))
       assert ret == chunk, f"read(0x{base_addr + off:04X}, {chunk}) failed: {ret}"
       result += bytes(self._f0_out_buf[:ret])
     return result[:length]
