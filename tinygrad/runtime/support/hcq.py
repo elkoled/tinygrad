@@ -290,10 +290,14 @@ class HCQSignal(Generic[HCQDeviceType]):
     """
     timeout = timeout or getenv("HCQDEV_WAIT_TIMEOUT_MS", 30000)
     start_time = int(time.perf_counter() * 1000)
-    while (not_passed:=(prev_value:=self.value) < value) and (cur_time:=int(time.perf_counter() * 1000)) - start_time < timeout:
+    prev_value = self.value
+    not_passed = prev_value < value
+    while not_passed and (cur_time:=int(time.perf_counter() * 1000)) - start_time < timeout:
       self._sleep(cur_time - start_time)
-      if self.value != prev_value: start_time = int(time.perf_counter() * 1000) # progress was made, reset timer
-    if not_passed and self.value < value: raise RuntimeError(f"Wait timeout: {timeout} ms! (the signal is not set to {value}, but {self.value})")
+      cur_value = self.value
+      if cur_value != prev_value: start_time = int(time.perf_counter() * 1000) # progress was made, reset timeout
+      prev_value, not_passed = cur_value, cur_value < value
+    if not_passed: raise RuntimeError(f"Wait timeout: {timeout} ms! (the signal is not set to {value}, but {prev_value})")
 
 @contextlib.contextmanager
 def hcq_profile(dev:HCQCompiled, enabled, desc, queue_type:Callable[[], HWQueue]|None=None, queue:HWQueue|None=None, dev_suff:str|None=None):
@@ -580,11 +584,12 @@ class HCQAllocator(HCQAllocatorBase, Generic[HCQDeviceType]):
 
     with hcq_profile(self.dev, queue_type=self.dev.hw_copy_queue_t, desc=TracingKey(f"TINY -> {self.dev.device}", ret=src.nbytes), enabled=PROFILE,
                      dev_suff="SDMA:0"):
-      for i in range(0, src.nbytes, self.b[0].size):
+      copyin_chunk = min(self.b[0].size, getenv("USB_AMD_COPYIN_CHUNK", self.b[0].size))
+      for i in range(0, src.nbytes, copyin_chunk):
         self.b_next = (self.b_next + 1) % len(self.b)
         self.dev.timeline_signal.wait(self.b_timeline[self.b_next])
 
-        lsize = min(self.b[self.b_next].size, src.nbytes - i)
+        lsize = min(copyin_chunk, src.nbytes - i)
         self.b[self.b_next].cpu_view().view(size=lsize, fmt='B')[:] = src.cast('B')[i:i+lsize]
         self.dev.hw_copy_queue_t().wait(self.dev.timeline_signal, self.dev.timeline_value - 1) \
                                   .copy(dest.offset(i), self.b[self.b_next], lsize) \

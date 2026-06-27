@@ -659,7 +659,14 @@ class AMDAllocator(HCQAllocator['AMDDevice']):
 
     with hcq_profile(self.dev, queue_type=self.dev.hw_copy_queue_t, desc=TracingKey(f"{self.dev.device} -> TINY", ret=dest.nbytes), enabled=PROFILE,
                      dev_suff="SDMA:0"):
-      for i in range(0, dest.nbytes, cp_size:=self.b[0].size):
+      cp_size = min(self.b[0].size, getenv("USB_AMD_COPYOUT_CHUNK", self.max_copyout_size or self.b[0].size))
+      if getenv("USB_AMD_DIRECT_COPYOUT", 0):
+        for i in range(0, dest.nbytes, cp_size):
+          lsize = min(cp_size, dest.nbytes - i)
+          rsize = round_up(lsize, 4)
+          dest.cast('B')[i:i+lsize] = self.dev.iface.pci_dev.usb.pcie_mem_read(src.va_addr + i, rsize)[:lsize]
+        return
+      for i in range(0, dest.nbytes, cp_size):
         self.dev.iface.pci_dev.usb.scsi_read_arm(lsize:=min(cp_size, dest.nbytes - i))
         self.dev.hw_copy_queue_t().wait(self.dev.timeline_signal, self.dev.timeline_value - 1) \
                                   .copy(self.b[0], src.offset(i), lsize) \

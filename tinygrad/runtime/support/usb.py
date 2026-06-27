@@ -1,4 +1,4 @@
-import ctypes, struct, dataclasses, array, itertools, time, functools
+import ctypes, struct, dataclasses, array, itertools, time, functools, contextlib
 from typing import Sequence
 from tinygrad.runtime.autogen import libusb
 from tinygrad.helpers import DEBUG, DEV, to_mv, round_up, OSX, getenv, ceildiv
@@ -34,6 +34,7 @@ class USB3:
 
   def __init__(self, dev:c.POINTER[libusb.struct_libusb_device], ep_data_in:int, ep_stat_in:int, ep_data_out:int, ep_cmd_out:int,
                max_streams:int=31, use_bot=False):
+    self.dev = dev
     self.ep_data_in, self.ep_stat_in, self.ep_data_out, self.ep_cmd_out = ep_data_in, ep_stat_in, ep_data_out, ep_cmd_out
     self.max_streams, self.use_bot = max_streams, use_bot
     self._transferred = ctypes.c_int(0)
@@ -46,8 +47,24 @@ class USB3:
     _buf = (ctypes.c_ubyte * 256)()
     _desc = libusb.struct_libusb_device_descriptor()
     checked(libusb.libusb_get_device_descriptor)(libusb.libusb_get_device(self.handle), ctypes.byref(_desc))
-    _ret = checked(libusb.libusb_get_string_descriptor_ascii)(self.handle, _desc.iProduct, _buf, 256)
-    self.product = bytes(_buf[:_ret]).decode("ascii", errors="replace")
+    self.is_asm2464 = (_desc.idVendor, _desc.idProduct) == (0xadd1, 0x0001)
+    if self.is_asm2464:
+      self.product = "custom"
+    else:
+      _last_product_err = None
+      for _attempt in range(4):
+        try:
+          _ret = checked(libusb.libusb_get_string_descriptor_ascii)(self.handle, _desc.iProduct, _buf, 256)
+          break
+        except RuntimeError as e:
+          _last_product_err = e
+          if DEBUG >= 1: print(f"am custom-usb: retry product string attempt {_attempt + 1}: {e}")
+          if getenv("ASM2464_LIBUSB_RESET", 0):
+            libusb.libusb_reset_device(self.handle)
+          time.sleep(0.25)
+      else:
+        raise _last_product_err or RuntimeError("product string read failed")
+      self.product = bytes(_buf[:_ret]).decode("ascii", errors="replace")
     self.is_custom = self.product.startswith("custom")
     if self.is_custom: self.use_bot = use_bot = True
 
@@ -56,12 +73,22 @@ class USB3:
       checked(libusb.libusb_detach_kernel_driver)(self.handle, 0)
       checked(libusb.libusb_reset_device)(self.handle)
 
-    # Set configuration and claim interface
-    checked(libusb.libusb_set_configuration)(self.handle, 1)
+    # Set configuration and claim interface. Re-setting configuration on the
+    # ASM2464 long-cable path can disturb EP0 even when the device is already
+    # configured, so avoid it unless the bridge is not configured yet.
+    if self.is_asm2464:
+      cfg = ctypes.c_int(-1)
+      if libusb.libusb_get_configuration(self.handle, ctypes.byref(cfg)) < 0 or cfg.value != 1:
+        with contextlib.suppress(Exception): checked(libusb.libusb_set_configuration)(self.handle, 1)
+    else:
+      checked(libusb.libusb_set_configuration)(self.handle, 1)
     checked(libusb.libusb_claim_interface)(self.handle, 0)
 
     if use_bot:
-      checked(libusb.libusb_set_interface_alt_setting)(self.handle, 0, 0)
+      try:
+        checked(libusb.libusb_set_interface_alt_setting)(self.handle, 0, 0)
+      except RuntimeError:
+        if not self.is_asm2464: raise
       self._tag = 0
     else:
       checked(libusb.libusb_set_interface_alt_setting)(self.handle, 0, 1)
@@ -88,6 +115,35 @@ class USB3:
 
       for slot in range(self.max_streams): struct.pack_into(">B", self.buf_cmd[slot], 3, slot + 1)
 
+  def _asm_recover(self, ep:int|None=None, reset:bool=False, reopen:bool=False):
+    if not getattr(self, "is_asm2464", False): return
+    if DEBUG >= 1: print(f"am custom-usb: recover ep={ep} reset={reset} reopen={reopen}")
+    if reopen:
+      try:
+        USB3.list_devices.cache_clear()
+        devs = USB3.list_devices(0xADD1, 0x0001)
+        if len(devs):
+          new_dev = devs[0][0]
+        else:
+          new_dev = self.dev
+        new_handle = c.init_c_var(ctypes.POINTER(libusb.struct_libusb_device_handle), lambda x: checked(libusb.libusb_open)(new_dev, x))
+        old_handle, self.dev, self.handle = self.handle, new_dev, new_handle
+        with contextlib.suppress(Exception): libusb.libusb_close(old_handle)
+      except Exception as e:
+        if DEBUG >= 1: print(f"am custom-usb: reopen failed: {e}")
+    if reset and getenv("ASM2464_LIBUSB_RESET", 0):
+      with contextlib.suppress(Exception): libusb.libusb_reset_device(self.handle)
+      time.sleep(0.25)
+    with contextlib.suppress(Exception):
+      if libusb.libusb_kernel_driver_active(self.handle, 0): libusb.libusb_detach_kernel_driver(self.handle, 0)
+    if not self.is_asm2464:
+      with contextlib.suppress(Exception): libusb.libusb_set_configuration(self.handle, 1)
+    with contextlib.suppress(Exception): libusb.libusb_claim_interface(self.handle, 0)
+    with contextlib.suppress(Exception): libusb.libusb_set_interface_alt_setting(self.handle, 0, 0 if self.use_bot else 1)
+    eps = (ep,) if ep is not None else (self.ep_data_out, self.ep_data_in, self.ep_stat_in, self.ep_cmd_out)
+    for cep in eps:
+      with contextlib.suppress(Exception): libusb.libusb_clear_halt(self.handle, cep)
+
   def _prep_transfer(self, tr, ep, stream_id, buf, length):
     tr.contents.dev_handle, tr.contents.endpoint, tr.contents.length, tr.contents.buffer = self.handle, ep, length, buf
     tr.contents.status, tr.contents.flags, tr.contents.timeout, tr.contents.num_iso_packets = 0xff, 0, 1000, 0
@@ -98,24 +154,56 @@ class USB3:
   def _submit_and_wait(self, cmds):
     for tr in cmds: checked(libusb.libusb_submit_transfer)(tr)
 
+    start_time = time.monotonic()
+    timeout = getenv("ASM_SUBMIT_WAIT_TIMEOUT_MS", 5000) / 1000
     running = len(cmds)
+    tv = libusb.struct_timeval()
+    tv.tv_sec, tv.tv_usec = 0, 100000
     while running:
-      checked(libusb.libusb_handle_events)(USB3.ctx())
+      checked(libusb.libusb_handle_events_timeout)(USB3.ctx(), ctypes.byref(tv))
       running = len(cmds)
       for tr in cmds:
         if tr.contents.status == libusb.LIBUSB_TRANSFER_COMPLETED: running -= 1
         elif tr.contents.status != 0xFF: raise RuntimeError(f"EP 0x{tr.contents.endpoint:02X} error: {tr.contents.status}")
+      if running and time.monotonic() - start_time > timeout:
+        for tr in cmds:
+          if tr.contents.status == 0xFF:
+            with contextlib.suppress(Exception): libusb.libusb_cancel_transfer(tr)
+        self._asm_recover(reopen=True)
+        raise RuntimeError(f"USB async transfer timeout after {timeout:.1f}s ({running}/{len(cmds)} still running)")
 
   def _bulk_out(self, ep: int, payload: bytes, timeout: int = 1000):
     if len(payload) > len(self._bulk_out_mv): self._bulk_out_buf, self._bulk_out_mv = alloc_cbuffer(len(payload))
     self._bulk_out_mv[:len(payload)] = payload
-    checked(libusb.libusb_bulk_transfer, f"bulk OUT 0x{ep:02X} failed")(self.handle, ep, self._bulk_out_buf, len(payload), self._transferred, timeout)
-    assert self._transferred.value == len(payload), f"bulk OUT short write on 0x{ep:02X}: {self._transferred.value}/{len(payload)} bytes"
+    last_err = None
+    for attempt in range(5):
+      ret = libusb.libusb_bulk_transfer(self.handle, ep, self._bulk_out_buf, len(payload), self._transferred, timeout)
+      if ret >= 0 and self._transferred.value == len(payload): return
+      if ret < 0:
+        last_err = RuntimeError(f"bulk OUT 0x{ep:02X} failed: {ctypes.string_at(libusb.libusb_strerror(ret)).decode()}")
+      else:
+        last_err = RuntimeError(f"bulk OUT short write on 0x{ep:02X}: {self._transferred.value}/{len(payload)} bytes")
+      if DEBUG >= 1: print(f"am custom-usb: retry bulk OUT 0x{ep:02X} len={len(payload)} attempt {attempt+1}: {last_err}")
+      time.sleep(0.02 * (attempt + 1))
+      with contextlib.suppress(Exception): libusb.libusb_clear_halt(self.handle, ep)
+      self._asm_recover(ep, reset=bool(getenv("ASM_USB_RESET_ON_RETRY", 0)) and (attempt >= 1 or ret in (-1, -4)), reopen=ret in (-1, -4))
+    raise last_err or RuntimeError(f"bulk OUT 0x{ep:02X} failed")
 
   def _bulk_in(self, ep: int, length: int, timeout: int = 1000) -> memoryview:
     if length > len(self._bulk_in_mv): self._bulk_in_buf, self._bulk_in_mv = alloc_cbuffer(length)
-    checked(libusb.libusb_bulk_transfer, f"bulk IN 0x{ep:02X} failed")(self.handle, ep, self._bulk_in_buf, length, self._transferred, timeout)
-    return self._bulk_in_mv[:self._transferred.value]
+    last_err = None
+    for attempt in range(5):
+      ret = libusb.libusb_bulk_transfer(self.handle, ep, self._bulk_in_buf, length, self._transferred, timeout)
+      if ret >= 0 and self._transferred.value == length: return self._bulk_in_mv[:self._transferred.value]
+      if ret < 0:
+        last_err = RuntimeError(f"bulk IN 0x{ep:02X} failed: {ctypes.string_at(libusb.libusb_strerror(ret)).decode()}")
+      else:
+        last_err = RuntimeError(f"bulk IN short read on 0x{ep:02X}: {self._transferred.value}/{length} bytes")
+      if DEBUG >= 1: print(f"am custom-usb: retry bulk IN 0x{ep:02X} len={length} attempt {attempt+1}: {last_err}")
+      time.sleep(0.02 * (attempt + 1))
+      with contextlib.suppress(Exception): libusb.libusb_clear_halt(self.handle, ep)
+      self._asm_recover(ep, reset=bool(getenv("ASM_USB_RESET_ON_RETRY", 0)) and (attempt >= 1 or ret in (-1, -4)), reopen=ret in (-1, -4))
+    raise last_err or RuntimeError(f"bulk IN 0x{ep:02X} failed")
 
   def send_batch(self, cdbs:list[bytes], idata:list[int]|None=None, odata:list[bytes|None]|None=None) -> list[bytes|None]:
     idata, odata = idata or [0] * len(cdbs), odata or [None] * len(cdbs)
@@ -200,11 +288,22 @@ class CustomASM24Controller:
     self._f0_out_buf, self._f0_out_mv = alloc_cbuffer(0x1000) # for f0 and e4, allocate big enough for e4
     self._f0_in_buf, _ = alloc_cbuffer(8)
 
-    # Custom firmware now boots with PCIe off. Power it on before probing the link.
-    ltssm = self.read(0xB450, 1)[0]
-    if ltssm != 0x78: self.set_pcie_power(True)
-    ltssm = self.read(0xB450, 1)[0]
-    if ltssm != 0x78: raise RuntimeError(f"PCIe link not up (LTSSM=0x{ltssm:02X}), custom firmware not ready")
+    # Custom firmware may boot with PCIe off. On the long comma USB link the
+    # debug XDATA LTSSM read can fail even when later F0 PCIe requests work, so
+    # use it as a best-effort hint instead of making it a hard init gate.
+    try:
+      ltssm = self.read(0xB450, 1)[0]
+    except AssertionError as e:
+      if DEBUG >= 1: print(f"am custom-usb: LTSSM pre-power read failed: {e}")
+      ltssm = None
+    if ltssm is not None and ltssm != 0x78:
+      self.set_pcie_power(True)
+      time.sleep(0.1)
+    try:
+      ltssm = self.read(0xB450, 1)[0]
+      if ltssm != 0x78 and DEBUG >= 1: print(f"am custom-usb: LTSSM=0x{ltssm:02X} after PCIe power on")
+    except AssertionError as e:
+      if DEBUG >= 1: print(f"am custom-usb: LTSSM post-power read failed, continuing to PCIe probe: {e}")
 
   def set_pcie_power(self, enabled:bool, timeout:int=10000):
     checked(libusb.libusb_control_transfer,
@@ -214,8 +313,16 @@ class CustomASM24Controller:
 
   def _f0_out(self, fmt_type:int, byte_en:int, address:int, value:int, mode:int=0):
     struct.pack_into('<III', self._f0_out_mv, 0, address & 0xFFFFFFFF, address >> 32, value)
-    ret = libusb.libusb_control_transfer(self.usb.handle, 0x40, 0xF0, fmt_type | (byte_en << 8), mode & 0x03, self._f0_out_buf, 12, 5000)
-    assert ret == 12, f"F0 OUT failed: {ret}"
+    last_ret = None
+    for attempt in range(8):
+      ret = libusb.libusb_control_transfer(self.usb.handle, 0x40, 0xF0, fmt_type | (byte_en << 8), mode & 0x03, self._f0_out_buf, 12, 5000)
+      if ret == 12: return
+      last_ret = ret
+      if DEBUG >= 1: print(f"am custom-usb: retry F0 OUT fmt=0x{fmt_type:02x} addr=0x{address:x} mode={mode} attempt {attempt+1}: {ret}")
+      time.sleep(0.01 * (attempt + 1))
+      with contextlib.suppress(Exception): libusb.libusb_clear_halt(self.usb.handle, 0x02)
+      self.usb._asm_recover(reset=attempt >= 2 or ret in (-1, -4), reopen=ret in (-1, -4))
+    assert ret == 12, f"F0 OUT failed: {last_ret}"
 
   def _f0_in(self) -> tuple[int, int, int]:
     ret = libusb.libusb_control_transfer(self.usb.handle, 0xC0, 0xF0, 0, 0, self._f0_in_buf, 8, 5000)
@@ -264,14 +371,37 @@ class CustomASM24Controller:
   def pcie_mem_write(self, address:int, values:list[int], size:int):
     """Streaming PCIe memory write via 0xF0 mode 1 + bulk OUT. Data is little-endian dwords on the wire."""
     if not values: return
-    self._f0_out(0x60, 0x0F, address, len(values), mode=1)
-    self.usb._bulk_out(0x02, struct.pack(f'<{len(values)}I', *values))
+    payload = struct.pack(f'<{len(values)}I', *values)
+    last_err = None
+    for attempt in range(5):
+      try:
+        self._f0_out(0x60, 0x0F, address, len(values), mode=1)
+        self.usb._bulk_out(0x02, payload)
+        return
+      except Exception as e:
+        last_err = e
+        if DEBUG >= 1: print(f"am custom-usb: retry pcie_mem_write 0x{address:x}+{len(payload)} attempt {attempt+1}: {e}")
+        time.sleep(0.03 * (attempt + 1))
+        self.usb._asm_recover(0x02, reset=attempt >= 1)
+    raise last_err or RuntimeError(f"pcie_mem_write 0x{address:x}+{len(payload)} failed")
 
   def pcie_mem_read(self, address:int, nbytes:int) -> bytes:
     """Streaming PCIe memory read via 0xF0 mode 2 + bulk IN. Returns little-endian bytes."""
     assert nbytes % 4 == 0, f"pcie_mem_read requires 4-byte aligned size, got {nbytes}"
-    self._f0_out(0x20, 0x0F, address, nbytes // 4, mode=2)
-    return self.usb._bulk_in(0x81, nbytes, timeout=30000)
+    last_err = None
+    for attempt in range(5):
+      try:
+        self._f0_out(0x20, 0x0F, address, nbytes // 4, mode=2)
+        ret = bytes(self.usb._bulk_in(0x81, nbytes, timeout=30000))
+        if len(ret) == nbytes: return ret
+        last_err = RuntimeError(f"short pcie_mem_read 0x{address:x}: {len(ret)}/{nbytes}")
+      except Exception as e:
+        last_err = e
+      if DEBUG >= 1: print(f"am custom-usb: retry pcie_mem_read 0x{address:x}+{nbytes} attempt {attempt+1}: {last_err}")
+      time.sleep(0.02 * (attempt + 1))
+      with contextlib.suppress(Exception): libusb.libusb_clear_halt(self.usb.handle, 0x81)
+      self.usb._asm_recover(0x81, reset=attempt >= 1, reopen=attempt >= 1)
+    raise last_err or RuntimeError(f"pcie_mem_read 0x{address:x}+{nbytes} failed")
 
   # === XDATA read/write (0xE4/0xE5 vendor control transfers) ===
 
@@ -280,16 +410,31 @@ class CustomASM24Controller:
     result = b''
     for off in range(0, length, 0xFF):
       chunk = min(0xFF, length - off)
-      ret = libusb.libusb_control_transfer(self.usb.handle, 0xC0, 0xE4, base_addr + off, 0, self._f0_out_buf, chunk, 1000)
-      assert ret == chunk, f"read(0x{base_addr + off:04X}, {chunk}) failed: {ret}"
+      last_ret = None
+      for attempt in range(8):
+        ret = libusb.libusb_control_transfer(self.usb.handle, 0xC0, 0xE4, base_addr + off, 0, self._f0_out_buf, chunk, 1000)
+        if ret == chunk: break
+        last_ret = ret
+        if DEBUG >= 1: print(f"am custom-usb: retry E4 read 0x{base_addr + off:04X}, {chunk} attempt {attempt+1}: {ret}")
+        time.sleep(min(0.25, 0.02 * (attempt + 1)))
+        if attempt >= 2:
+          with contextlib.suppress(Exception): libusb.libusb_clear_halt(self.usb.handle, 0x81)
+          self.usb._asm_recover(reset=attempt >= 5 or ret == -4, reopen=ret == -4 and attempt >= 4)
+      assert ret == chunk, f"read(0x{base_addr + off:04X}, {chunk}) failed: {last_ret}"
       result += bytes(self._f0_out_buf[:ret])
     return result[:length]
 
   def write(self, base_addr:int, data:bytes, **kwargs):
     """Write to chip XDATA via vendor control OUT (bRequest=0xE5). wValue=addr, wIndex=val."""
     for off, val in enumerate(data):
-      checked(libusb.libusb_control_transfer,
-              f"write(0x{base_addr + off:04X}, 0x{val:02X}) failed")(self.usb.handle, 0x40, 0xE5, base_addr + off, val, None, 0, 1000)
+      last_ret = None
+      for attempt in range(8):
+        ret = libusb.libusb_control_transfer(self.usb.handle, 0x40, 0xE5, base_addr + off, val, None, 0, 1000)
+        if ret >= 0: break
+        last_ret = ret
+        if DEBUG >= 1: print(f"am custom-usb: retry E5 write 0x{base_addr + off:04X}=0x{val:02X} attempt {attempt+1}: {ret}")
+        time.sleep(0.01 * (attempt + 1))
+      assert ret >= 0, f"write(0x{base_addr + off:04X}, 0x{val:02X}) failed: {last_ret}"
 
   def scsi_write(self, buf:bytes, lba:int=0):
     """Write to SRAM via 0xF2 vendor command + bulk OUT."""
@@ -297,16 +442,47 @@ class CustomASM24Controller:
     sectors = len(buf_padded) // 512
     num_slots = round_up(len(buf_padded), 0x4000) // 0x4000  # 16KB per slot
     # 0xF2 OUT: wValue=sectors, wIndex=start_slot|(num_slots<<8)
-    windex = (num_slots & 0xFF) << 8
-    checked(libusb.libusb_control_transfer, "F2 setup failed")(self.usb.handle, 0x40, 0xF2, sectors, windex, None, 0, 1000)
-    self.usb._bulk_out(0x02, buf_padded)
+    last_err = None
+    for attempt in range(5):
+      try:
+        windex = (num_slots & 0xFF) << 8
+        checked(libusb.libusb_control_transfer, "F2 setup failed")(self.usb.handle, 0x40, 0xF2, sectors, windex, None, 0, 1000)
+        self.usb._bulk_out(0x02, buf_padded)
+        return
+      except Exception as e:
+        last_err = e
+        if DEBUG >= 1: print(f"am custom-usb: retry scsi_write len={len(buf_padded)} attempt {attempt+1}: {e}")
+        time.sleep(0.03 * (attempt + 1))
+        with contextlib.suppress(Exception): libusb.libusb_clear_halt(self.usb.handle, 0x02)
+    raise last_err or RuntimeError(f"scsi_write len={len(buf_padded)} failed")
 
   def scsi_read_arm(self, size:int):
     windex = (ceildiv(size, 0x4000) & 0xFF) << 8
-    checked(libusb.libusb_control_transfer,
-            "F2 read arm failed")(self.usb.handle, 0x40, 0xF2, (ceildiv(size, 512) & 0x7FFF) | 0x8000, windex, None, 0, 1000)
+    last_err = None
+    for attempt in range(8):
+      try:
+        checked(libusb.libusb_control_transfer,
+                "F2 read arm failed")(self.usb.handle, 0x40, 0xF2, (ceildiv(size, 512) & 0x7FFF) | 0x8000, windex, None, 0, 1000)
+        return
+      except Exception as e:
+        last_err = e
+        if DEBUG >= 1: print(f"am custom-usb: retry F2 read arm len={size} attempt {attempt+1}: {e}")
+        time.sleep(0.02 * (attempt + 1))
+    raise last_err or RuntimeError(f"F2 read arm len={size} failed")
 
-  def scsi_read(self, size:int) -> memoryview: return self.usb._bulk_in(0x81, round_up(size, 512), timeout=10000)[:size]
+  def scsi_read(self, size:int) -> memoryview:
+    padded = round_up(size, 512)
+    last_err = None
+    for attempt in range(5):
+      try:
+        self.scsi_read_arm(size)
+        return self.usb._bulk_in(0x81, padded, timeout=10000)[:size]
+      except Exception as e:
+        last_err = e
+        if DEBUG >= 1: print(f"am custom-usb: retry scsi_read len={padded} attempt {attempt+1}: {e}")
+        time.sleep(0.03 * (attempt + 1))
+        with contextlib.suppress(Exception): libusb.libusb_clear_halt(self.usb.handle, 0x81)
+    raise last_err or RuntimeError(f"scsi_read len={padded} failed")
 
 class ASM24Controller:
   def __init__(self, usb:USB3|None=None):

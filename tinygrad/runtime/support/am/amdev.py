@@ -195,6 +195,13 @@ class AMDev:
     self.reg("regSCRATCH_REG7").write(AMDev.Version)
     self.reg("regSCRATCH_REG6").write(1) # set initialized state.
     if DEBUG >= 2: print(f"am {self.devfmt}: boot done")
+    try:
+      if self.devfmt.startswith("usb:"):
+        with open("/sys/module/usbcore/parameters/asm2464_suppress_warm_reset", "w") as f: f.write("N")
+        with open("/sys/module/usbcore/parameters/asm2464_warm_reset_budget", "w") as f: f.write("20")
+        if DEBUG >= 1: print(f"am {self.devfmt}: leaving ASM2464 warm-reset recovery enabled after AMD boot")
+    except Exception as e:
+      if DEBUG >= 1: print(f"am {self.devfmt}: failed to enable ASM2464 warm-reset recovery after AMD boot: {e}")
 
   def init_sw(self, smi_dev=False):
     self.smi_dev, self.is_err_state = smi_dev, False
