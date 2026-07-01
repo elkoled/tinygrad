@@ -431,15 +431,15 @@ class CustomASM24Controller:
     for off in range(0, length, 0xFF):
       chunk = min(0xFF, length - off)
       last_ret = None
-      for attempt in range(8):
+      for attempt in range(getenv("ASM2464_XDATA_READ_RETRIES", 32)):
         ret = libusb.libusb_control_transfer(self.usb.handle, 0xC0, 0xE4, base_addr + off, 0, self._f0_out_buf, chunk, 1000)
         if ret == chunk: break
         last_ret = ret
         if DEBUG >= 1: print(f"am custom-usb: retry E4 read 0x{base_addr + off:04X}, {chunk} attempt {attempt+1}: {ret}")
-        time.sleep(min(0.25, 0.02 * (attempt + 1)))
+        time.sleep(min(0.5, 0.03 * (attempt + 1)))
         if attempt >= 2:
           with contextlib.suppress(Exception): self.usb._clear_halt(0x81)
-          self.usb._asm_recover(reset=attempt >= 5 or ret == -4, reopen=ret == -4 and attempt >= 4)
+          self.usb._asm_recover(reset=attempt >= 5 or ret == -4, reopen=ret == -4 and attempt >= 2)
       assert ret == chunk, f"read(0x{base_addr + off:04X}, {chunk}) failed: {last_ret}"
       result += bytes(self._f0_out_buf[:ret])
     return result[:length]
