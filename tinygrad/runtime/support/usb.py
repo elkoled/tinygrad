@@ -131,6 +131,8 @@ class USB3:
       time.sleep(12.0)
       reopen = True
       if DEBUG >= 1: print("am custom-usb: USB-PD hard reset complete")
+      if getenv("ASM2464_ABORT_AFTER_SYSFS_REENUM", 1):
+        raise RuntimeError("ASM2464 re-enumerated during USB recovery")
     if reopen:
       try:
         USB3.list_devices.cache_clear()
