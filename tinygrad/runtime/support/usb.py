@@ -304,7 +304,8 @@ class CustomASM24Controller:
     self._f0_in_buf, _ = alloc_cbuffer(8)
 
     if getenv("ASM2464_SKIP_LTSSM_E4", 1):
-      with contextlib.suppress(Exception): self.set_pcie_power(True, timeout=1000)
+      if getenv("ASM2464_POWER_ON_F3", 0):
+        with contextlib.suppress(Exception): self.set_pcie_power(True, timeout=1000)
     else:
       # Custom firmware may boot with PCIe off. On the long comma USB link the
       # debug XDATA LTSSM read can hang, so keep it opt-in only.
