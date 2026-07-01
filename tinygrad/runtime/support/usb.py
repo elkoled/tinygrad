@@ -1,4 +1,4 @@
-import ctypes, struct, dataclasses, array, itertools, time, functools, contextlib, os
+import ctypes, struct, dataclasses, array, itertools, time, functools, contextlib, os, subprocess
 from typing import Sequence
 from tinygrad.runtime.autogen import libusb
 from tinygrad.helpers import DEBUG, DEV, to_mv, round_up, OSX, getenv, ceildiv
@@ -120,14 +120,13 @@ class USB3:
     if DEBUG >= 1: print(f"am custom-usb: recover ep={ep} reset={reset} reopen={reopen}")
     if reset and getenv("ASM2464_SYSFS_REENUM", 1):
       # libusb_reset_device is not enough after the ASM2464 bridge reports
-      # ENODEV on the long cable. Force the xHCI port through disconnect and
-      # reconnect, then reopen the freshly enumerated device below.
-      rc0 = os.system("sudo sh -c 'echo 0 > /sys/bus/usb/devices/4-1/authorized' >/dev/null 2>&1")
-      time.sleep(0.5)
-      rc1 = os.system("sudo sh -c 'echo 1 > /sys/bus/usb/devices/4-1/authorized' >/dev/null 2>&1")
-      time.sleep(2.0)
+      # ENODEV on the long cable. USB authorization writes can block in the
+      # bad state, so recover through the Type-C/PD hard reset path instead.
+      subprocess.run(["sudo", "-n", "tee", "/sys/class/usbpd/usbpd0/hard_reset"], input="1\n", text=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+      time.sleep(12.0)
       reopen = True
-      if DEBUG >= 1: print(f"am custom-usb: sysfs reenum rc0={rc0} rc1={rc1}")
+      if DEBUG >= 1: print("am custom-usb: USB-PD hard reset complete")
     if reopen:
       try:
         USB3.list_devices.cache_clear()
