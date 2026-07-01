@@ -116,13 +116,13 @@ class USB3:
       for slot in range(self.max_streams): struct.pack_into(">B", self.buf_cmd[slot], 3, slot + 1)
 
   def _clear_halt(self, ep:int):
-    if self.is_asm2464 and not getenv("ASM2464_CLEAR_HALT", 0): return
+    if self.is_asm2464 and not getenv("ASM2464_CLEAR_HALT", 1): return
     libusb.libusb_clear_halt(self.handle, ep)
 
   def _asm_recover(self, ep:int|None=None, reset:bool=False, reopen:bool=False):
     if not getattr(self, "is_asm2464", False): return
     if DEBUG >= 1: print(f"am custom-usb: recover ep={ep} reset={reset} reopen={reopen}")
-    if reset and getenv("ASM2464_SYSFS_REENUM", 1):
+    if reset and getenv("ASM2464_SYSFS_REENUM", 0):
       # libusb_reset_device is not enough after the ASM2464 bridge reports
       # ENODEV on the long cable. USB authorization writes can block in the
       # bad state, so recover through the Type-C/PD hard reset path instead.
@@ -191,7 +191,7 @@ class USB3:
     if len(payload) > len(self._bulk_out_mv): self._bulk_out_buf, self._bulk_out_mv = alloc_cbuffer(len(payload))
     self._bulk_out_mv[:len(payload)] = payload
     last_err = None
-    tries = getenv("ASM2464_BULK_RETRIES", 2) if self.is_asm2464 else 5
+    tries = getenv("ASM2464_BULK_RETRIES", 8) if self.is_asm2464 else 5
     for attempt in range(tries):
       ret = libusb.libusb_bulk_transfer(self.handle, ep, self._bulk_out_buf, len(payload), self._transferred, timeout)
       if ret >= 0 and self._transferred.value == len(payload): return
@@ -208,7 +208,7 @@ class USB3:
   def _bulk_in(self, ep: int, length: int, timeout: int = 1000) -> memoryview:
     if length > len(self._bulk_in_mv): self._bulk_in_buf, self._bulk_in_mv = alloc_cbuffer(length)
     last_err = None
-    tries = getenv("ASM2464_BULK_RETRIES", 2) if self.is_asm2464 else 5
+    tries = getenv("ASM2464_BULK_RETRIES", 8) if self.is_asm2464 else 5
     for attempt in range(tries):
       ret = libusb.libusb_bulk_transfer(self.handle, ep, self._bulk_in_buf, length, self._transferred, timeout)
       if ret >= 0 and self._transferred.value == length: return self._bulk_in_mv[:self._transferred.value]
