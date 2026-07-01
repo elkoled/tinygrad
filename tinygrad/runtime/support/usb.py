@@ -95,7 +95,7 @@ class USB3:
 
       # Clear any stalled endpoints
       all_eps = (self.ep_data_out, self.ep_data_in, self.ep_stat_in, self.ep_cmd_out)
-      for ep in all_eps: checked(libusb.libusb_clear_halt)(self.handle, ep)
+      for ep in all_eps: self._clear_halt(ep)
 
       # Allocate streams
       stream_eps = (ctypes.c_uint8 * 3)(self.ep_data_out, self.ep_data_in, self.ep_stat_in)
@@ -114,6 +114,10 @@ class USB3:
       self.buf_data_out_mvs = [to_mv(ctypes.addressof(self.buf_data_out[i]), 0x80000) for i in range(self.max_streams)]
 
       for slot in range(self.max_streams): struct.pack_into(">B", self.buf_cmd[slot], 3, slot + 1)
+
+  def _clear_halt(self, ep:int):
+    if self.is_asm2464 and not getenv("ASM2464_CLEAR_HALT", 0): return
+    libusb.libusb_clear_halt(self.handle, ep)
 
   def _asm_recover(self, ep:int|None=None, reset:bool=False, reopen:bool=False):
     if not getattr(self, "is_asm2464", False): return
@@ -151,7 +155,7 @@ class USB3:
     with contextlib.suppress(Exception): libusb.libusb_set_interface_alt_setting(self.handle, 0, 0 if self.use_bot else 1)
     eps = (ep,) if ep is not None else (self.ep_data_out, self.ep_data_in, self.ep_stat_in, self.ep_cmd_out)
     for cep in eps:
-      with contextlib.suppress(Exception): libusb.libusb_clear_halt(self.handle, cep)
+      with contextlib.suppress(Exception): self._clear_halt(cep)
 
   def _prep_transfer(self, tr, ep, stream_id, buf, length):
     tr.contents.dev_handle, tr.contents.endpoint, tr.contents.length, tr.contents.buffer = self.handle, ep, length, buf
@@ -195,7 +199,7 @@ class USB3:
         last_err = RuntimeError(f"bulk OUT short write on 0x{ep:02X}: {self._transferred.value}/{len(payload)} bytes")
       if DEBUG >= 1: print(f"am custom-usb: retry bulk OUT 0x{ep:02X} len={len(payload)} attempt {attempt+1}: {last_err}")
       time.sleep(0.02 * (attempt + 1))
-      with contextlib.suppress(Exception): libusb.libusb_clear_halt(self.handle, ep)
+      with contextlib.suppress(Exception): self._clear_halt(ep)
       self._asm_recover(ep, reset=(self.is_asm2464 and attempt >= 1) or (bool(getenv("ASM_USB_RESET_ON_RETRY", 0)) and (attempt >= 1 or ret in (-1, -4))), reopen=self.is_asm2464 or ret in (-1, -4))
     raise last_err or RuntimeError(f"bulk OUT 0x{ep:02X} failed")
 
@@ -212,7 +216,7 @@ class USB3:
         last_err = RuntimeError(f"bulk IN short read on 0x{ep:02X}: {self._transferred.value}/{length} bytes")
       if DEBUG >= 1: print(f"am custom-usb: retry bulk IN 0x{ep:02X} len={length} attempt {attempt+1}: {last_err}")
       time.sleep(0.02 * (attempt + 1))
-      with contextlib.suppress(Exception): libusb.libusb_clear_halt(self.handle, ep)
+      with contextlib.suppress(Exception): self._clear_halt(ep)
       self._asm_recover(ep, reset=(self.is_asm2464 and attempt >= 1) or (bool(getenv("ASM_USB_RESET_ON_RETRY", 0)) and (attempt >= 1 or ret in (-1, -4))), reopen=self.is_asm2464 or ret in (-1, -4))
     raise last_err or RuntimeError(f"bulk IN 0x{ep:02X} failed")
 
@@ -299,22 +303,24 @@ class CustomASM24Controller:
     self._f0_out_buf, self._f0_out_mv = alloc_cbuffer(0x1000) # for f0 and e4, allocate big enough for e4
     self._f0_in_buf, _ = alloc_cbuffer(8)
 
-    # Custom firmware may boot with PCIe off. On the long comma USB link the
-    # debug XDATA LTSSM read can fail even when later F0 PCIe requests work, so
-    # use it as a best-effort hint instead of making it a hard init gate.
-    try:
-      ltssm = self.read(0xB450, 1)[0]
-    except AssertionError as e:
-      if DEBUG >= 1: print(f"am custom-usb: LTSSM pre-power read failed: {e}")
-      ltssm = None
-    if ltssm is not None and ltssm != 0x78:
-      self.set_pcie_power(True)
-      time.sleep(0.1)
-    try:
-      ltssm = self.read(0xB450, 1)[0]
-      if ltssm != 0x78 and DEBUG >= 1: print(f"am custom-usb: LTSSM=0x{ltssm:02X} after PCIe power on")
-    except AssertionError as e:
-      if DEBUG >= 1: print(f"am custom-usb: LTSSM post-power read failed, continuing to PCIe probe: {e}")
+    if getenv("ASM2464_SKIP_LTSSM_E4", 1):
+      with contextlib.suppress(Exception): self.set_pcie_power(True, timeout=1000)
+    else:
+      # Custom firmware may boot with PCIe off. On the long comma USB link the
+      # debug XDATA LTSSM read can hang, so keep it opt-in only.
+      try:
+        ltssm = self.read(0xB450, 1)[0]
+      except AssertionError as e:
+        if DEBUG >= 1: print(f"am custom-usb: LTSSM pre-power read failed: {e}")
+        ltssm = None
+      if ltssm is not None and ltssm != 0x78:
+        self.set_pcie_power(True)
+        time.sleep(0.1)
+      try:
+        ltssm = self.read(0xB450, 1)[0]
+        if ltssm != 0x78 and DEBUG >= 1: print(f"am custom-usb: LTSSM=0x{ltssm:02X} after PCIe power on")
+      except AssertionError as e:
+        if DEBUG >= 1: print(f"am custom-usb: LTSSM post-power read failed, continuing to PCIe probe: {e}")
 
   def set_pcie_power(self, enabled:bool, timeout:int=10000):
     checked(libusb.libusb_control_transfer,
@@ -331,7 +337,7 @@ class CustomASM24Controller:
       last_ret = ret
       if DEBUG >= 1: print(f"am custom-usb: retry F0 OUT fmt=0x{fmt_type:02x} addr=0x{address:x} mode={mode} attempt {attempt+1}: {ret}")
       time.sleep(0.01 * (attempt + 1))
-      with contextlib.suppress(Exception): libusb.libusb_clear_halt(self.usb.handle, 0x02)
+      with contextlib.suppress(Exception): self.usb._clear_halt(0x02)
       self.usb._asm_recover(reset=attempt >= 2 or ret in (-1, -4), reopen=ret in (-1, -4))
     assert ret == 12, f"F0 OUT failed: {last_ret}"
 
@@ -410,7 +416,7 @@ class CustomASM24Controller:
         last_err = e
       if DEBUG >= 1: print(f"am custom-usb: retry pcie_mem_read 0x{address:x}+{nbytes} attempt {attempt+1}: {last_err}")
       time.sleep(0.02 * (attempt + 1))
-      with contextlib.suppress(Exception): libusb.libusb_clear_halt(self.usb.handle, 0x81)
+      with contextlib.suppress(Exception): self.usb._clear_halt(0x81)
       self.usb._asm_recover(0x81, reset=attempt >= 1, reopen=attempt >= 1)
     raise last_err or RuntimeError(f"pcie_mem_read 0x{address:x}+{nbytes} failed")
 
@@ -429,7 +435,7 @@ class CustomASM24Controller:
         if DEBUG >= 1: print(f"am custom-usb: retry E4 read 0x{base_addr + off:04X}, {chunk} attempt {attempt+1}: {ret}")
         time.sleep(min(0.25, 0.02 * (attempt + 1)))
         if attempt >= 2:
-          with contextlib.suppress(Exception): libusb.libusb_clear_halt(self.usb.handle, 0x81)
+          with contextlib.suppress(Exception): self.usb._clear_halt(0x81)
           self.usb._asm_recover(reset=attempt >= 5 or ret == -4, reopen=ret == -4 and attempt >= 4)
       assert ret == chunk, f"read(0x{base_addr + off:04X}, {chunk}) failed: {last_ret}"
       result += bytes(self._f0_out_buf[:ret])
@@ -464,7 +470,7 @@ class CustomASM24Controller:
         last_err = e
         if DEBUG >= 1: print(f"am custom-usb: retry scsi_write len={len(buf_padded)} attempt {attempt+1}: {e}")
         time.sleep(0.03 * (attempt + 1))
-        with contextlib.suppress(Exception): libusb.libusb_clear_halt(self.usb.handle, 0x02)
+        with contextlib.suppress(Exception): self.usb._clear_halt(0x02)
     raise last_err or RuntimeError(f"scsi_write len={len(buf_padded)} failed")
 
   def scsi_read_arm(self, size:int):
@@ -492,7 +498,7 @@ class CustomASM24Controller:
         last_err = e
         if DEBUG >= 1: print(f"am custom-usb: retry scsi_read len={padded} attempt {attempt+1}: {e}")
         time.sleep(0.03 * (attempt + 1))
-        with contextlib.suppress(Exception): libusb.libusb_clear_halt(self.usb.handle, 0x81)
+        with contextlib.suppress(Exception): self.usb._clear_halt(0x81)
         self.usb._asm_recover(0x81, reset=attempt >= 1, reopen=True)
     raise last_err or RuntimeError(f"scsi_read len={padded} failed")
 
