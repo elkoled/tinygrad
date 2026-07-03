@@ -13,6 +13,14 @@ def checked(fn, msg=None):
     return rc
   return wrapper
 
+def handle_events_timeout(ctx, tv):
+  ret = libusb.libusb_handle_events_timeout(ctx, ctypes.byref(tv))
+  if ret == libusb.LIBUSB_ERROR_INTERRUPTED:
+    return ret
+  if ret < 0:
+    raise RuntimeError(f"libusb_handle_events_timeout: {ctypes.string_at(libusb.libusb_strerror(ret)).decode()}")
+  return ret
+
 class USB3:
   @staticmethod
   @functools.cache
@@ -40,7 +48,6 @@ class USB3:
     self._transferred = ctypes.c_int(0)
     self._bulk_in_buf, self._bulk_in_mv = alloc_cbuffer(4 << 20)
     self._bulk_out_buf, self._bulk_out_mv = alloc_cbuffer(4 << 20)
-
     self.handle = c.init_c_var(c.POINTER[libusb.struct_libusb_device_handle], lambda x: checked(libusb.libusb_open)(dev, x))
 
     # Read product string descriptor
@@ -175,7 +182,7 @@ class USB3:
     tv = libusb.struct_timeval()
     tv.tv_sec, tv.tv_usec = 0, 100000
     while running:
-      checked(libusb.libusb_handle_events_timeout)(USB3.ctx(), ctypes.byref(tv))
+      handle_events_timeout(USB3.ctx(), tv)
       running = len(cmds)
       for tr in cmds:
         if tr.contents.status == libusb.LIBUSB_TRANSFER_COMPLETED: running -= 1
@@ -186,6 +193,91 @@ class USB3:
             with contextlib.suppress(Exception): libusb.libusb_cancel_transfer(tr)
         self._asm_recover(reopen=True)
         raise RuntimeError(f"USB async transfer timeout after {timeout:.1f}s ({running}/{len(cmds)} still running)")
+
+  def _bulk_in_async(self, ep:int, length:int, timeout:int) -> memoryview:
+    tr = libusb.libusb_alloc_transfer(0)
+    submitted = False
+    done = False
+    try:
+      self._prep_transfer(tr, ep, None, self._bulk_in_buf, length).contents.timeout = timeout
+      checked(libusb.libusb_submit_transfer)(tr)
+      submitted = True
+
+      start_time = time.monotonic()
+      wall_timeout = getenv("ASM2464_ASYNC_BULK_IN_WALL_TIMEOUT_MS", 1500) / 1000
+      tv = libusb.struct_timeval()
+      tv.tv_sec, tv.tv_usec = 0, 100000
+      while tr.contents.status == 0xFF:
+        handle_events_timeout(USB3.ctx(), tv)
+        if time.monotonic() - start_time > wall_timeout:
+          with contextlib.suppress(Exception): libusb.libusb_cancel_transfer(tr)
+          cancel_start = time.monotonic()
+          while tr.contents.status == 0xFF and time.monotonic() - cancel_start < 0.5:
+            with contextlib.suppress(Exception): handle_events_timeout(USB3.ctx(), tv)
+          self._asm_recover(ep, reopen=True)
+          raise RuntimeError(f"bulk IN 0x{ep:02X} async timeout after {wall_timeout:.1f}s")
+
+      if tr.contents.status != libusb.LIBUSB_TRANSFER_COMPLETED:
+        raise RuntimeError(f"bulk IN 0x{ep:02X} async error: {tr.contents.status}")
+      done = True
+      if tr.contents.actual_length != length:
+        raise RuntimeError(f"bulk IN short read on 0x{ep:02X}: {tr.contents.actual_length}/{length} bytes")
+      return self._bulk_in_mv[:tr.contents.actual_length]
+    finally:
+      if submitted and not done and tr.contents.status == 0xFF:
+        with contextlib.suppress(Exception): libusb.libusb_cancel_transfer(tr)
+        cancel_start = time.monotonic()
+        tv = libusb.struct_timeval()
+        tv.tv_sec, tv.tv_usec = 0, 100000
+        while tr.contents.status == 0xFF and time.monotonic() - cancel_start < 1.0:
+          with contextlib.suppress(Exception): handle_events_timeout(USB3.ctx(), tv)
+      libusb.libusb_free_transfer(tr)
+
+  def _control_out_async(self, request:int, value:int, index:int, timeout:int=1000) -> None:
+    buf = (ctypes.c_ubyte * 8)()
+    struct.pack_into("<BBHHH", buf, 0, 0x40, request, value, index, 0)
+    tr = libusb.libusb_alloc_transfer(0)
+    submitted = False
+    done = False
+    try:
+      tr.contents.dev_handle = self.handle
+      tr.contents.endpoint = 0
+      tr.contents.type = libusb.LIBUSB_TRANSFER_TYPE_CONTROL
+      tr.contents.timeout = timeout
+      tr.contents.status = 0xff
+      tr.contents.length = 8
+      tr.contents.actual_length = 0
+      tr.contents.flags = 0
+      tr.contents.buffer = buf
+      tr.contents.num_iso_packets = 0
+      checked(libusb.libusb_submit_transfer)(tr)
+      submitted = True
+
+      start_time = time.monotonic()
+      wall_timeout = getenv("ASM2464_ASYNC_CONTROL_OUT_WALL_TIMEOUT_MS", 1500) / 1000
+      tv = libusb.struct_timeval()
+      tv.tv_sec, tv.tv_usec = 0, 100000
+      while tr.contents.status == 0xFF:
+        handle_events_timeout(USB3.ctx(), tv)
+        if time.monotonic() - start_time > wall_timeout:
+          with contextlib.suppress(Exception): libusb.libusb_cancel_transfer(tr)
+          cancel_start = time.monotonic()
+          while tr.contents.status == 0xFF and time.monotonic() - cancel_start < 0.5:
+            with contextlib.suppress(Exception): handle_events_timeout(USB3.ctx(), tv)
+          self._asm_recover(reopen=True)
+          raise RuntimeError(f"control OUT 0x{request:02X} async timeout after {wall_timeout:.1f}s")
+      if tr.contents.status != libusb.LIBUSB_TRANSFER_COMPLETED:
+        raise RuntimeError(f"control OUT 0x{request:02X} async error: {tr.contents.status}")
+      done = True
+    finally:
+      if submitted and not done and tr.contents.status == 0xFF:
+        with contextlib.suppress(Exception): libusb.libusb_cancel_transfer(tr)
+        cancel_start = time.monotonic()
+        tv = libusb.struct_timeval()
+        tv.tv_sec, tv.tv_usec = 0, 100000
+        while tr.contents.status == 0xFF and time.monotonic() - cancel_start < 1.0:
+          with contextlib.suppress(Exception): handle_events_timeout(USB3.ctx(), tv)
+      libusb.libusb_free_transfer(tr)
 
   def _bulk_out(self, ep: int, payload: bytes, timeout: int = 1000):
     if len(payload) > len(self._bulk_out_mv): self._bulk_out_buf, self._bulk_out_mv = alloc_cbuffer(len(payload))
@@ -210,12 +302,18 @@ class USB3:
     last_err = None
     tries = getenv("ASM2464_BULK_RETRIES", 8) if self.is_asm2464 else 5
     for attempt in range(tries):
-      ret = libusb.libusb_bulk_transfer(self.handle, ep, self._bulk_in_buf, length, self._transferred, timeout)
-      if ret >= 0 and self._transferred.value == length: return self._bulk_in_mv[:self._transferred.value]
-      if ret < 0:
-        last_err = RuntimeError(f"bulk IN 0x{ep:02X} failed: {ctypes.string_at(libusb.libusb_strerror(ret)).decode()}")
+      if self.is_asm2464 and getenv("ASM2464_ASYNC_BULK_IN", 1):
+        try:
+          return self._bulk_in_async(ep, length, timeout)
+        except RuntimeError as e:
+          last_err = e
       else:
-        last_err = RuntimeError(f"bulk IN short read on 0x{ep:02X}: {self._transferred.value}/{length} bytes")
+        ret = libusb.libusb_bulk_transfer(self.handle, ep, self._bulk_in_buf, length, self._transferred, timeout)
+        if ret >= 0 and self._transferred.value == length: return self._bulk_in_mv[:self._transferred.value]
+        if ret < 0:
+          last_err = RuntimeError(f"bulk IN 0x{ep:02X} failed: {ctypes.string_at(libusb.libusb_strerror(ret)).decode()}")
+        else:
+          last_err = RuntimeError(f"bulk IN short read on 0x{ep:02X}: {self._transferred.value}/{length} bytes")
       if DEBUG >= 1: print(f"am custom-usb: retry bulk IN 0x{ep:02X} len={length} attempt {attempt+1}: {last_err}")
       time.sleep(0.02 * (attempt + 1))
       with contextlib.suppress(Exception): self._clear_halt(ep)
@@ -412,7 +510,7 @@ class CustomASM24Controller:
     for attempt in range(getenv("ASM2464_SCSI_READ_RETRIES", 20)):
       try:
         self._f0_out(0x20, 0x0F, address, nbytes // 4, mode=2)
-        ret = bytes(self.usb._bulk_in(0x81, nbytes, timeout=30000))
+        ret = bytes(self.usb._bulk_in(0x81, nbytes, timeout=getenv("ASM2464_PCIE_READ_TIMEOUT_MS", 30000)))
         if len(ret) == nbytes: return ret
         last_err = RuntimeError(f"short pcie_mem_read 0x{address:x}: {len(ret)}/{nbytes}")
       except Exception as e:
@@ -466,7 +564,10 @@ class CustomASM24Controller:
     for attempt in range(5):
       try:
         windex = (num_slots & 0xFF) << 8
-        checked(libusb.libusb_control_transfer, "F2 setup failed")(self.usb.handle, 0x40, 0xF2, sectors, windex, None, 0, 1000)
+        if self.usb.is_asm2464 and getenv("ASM2464_ASYNC_F2_SETUP", 1):
+          self.usb._control_out_async(0xF2, sectors, windex, 1000)
+        else:
+          checked(libusb.libusb_control_transfer, "F2 setup failed")(self.usb.handle, 0x40, 0xF2, sectors, windex, None, 0, 1000)
         self.usb._bulk_out(0x02, buf_padded)
         return
       except Exception as e:
@@ -481,8 +582,12 @@ class CustomASM24Controller:
     last_err = None
     for attempt in range(8):
       try:
-        checked(libusb.libusb_control_transfer,
-                "F2 read arm failed")(self.usb.handle, 0x40, 0xF2, (ceildiv(size, 512) & 0x7FFF) | 0x8000, windex, None, 0, 1000)
+        value = (ceildiv(size, 512) & 0x7FFF) | 0x8000
+        if self.usb.is_asm2464 and getenv("ASM2464_ASYNC_F2_SETUP", 1):
+          self.usb._control_out_async(0xF2, value, windex, 1000)
+        else:
+          checked(libusb.libusb_control_transfer,
+                  "F2 read arm failed")(self.usb.handle, 0x40, 0xF2, value, windex, None, 0, 1000)
         return
       except Exception as e:
         last_err = e
@@ -496,7 +601,7 @@ class CustomASM24Controller:
     for attempt in range(5):
       try:
         self.scsi_read_arm(size)
-        return self.usb._bulk_in(0x81, padded, timeout=10000)[:size]
+        return self.usb._bulk_in(0x81, padded, timeout=getenv("ASM2464_SCSI_READ_TIMEOUT_MS", 10000))[:size]
       except Exception as e:
         last_err = e
         if DEBUG >= 1: print(f"am custom-usb: retry scsi_read len={padded} attempt {attempt+1}: {e}")
