@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import cast
+from typing import cast, Iterable
 import os, ctypes, struct, hashlib, functools, importlib, mmap, errno, array, contextlib, sys, weakref, itertools, collections, atexit
 assert sys.platform != 'win32'
 from dataclasses import dataclass
@@ -494,10 +494,10 @@ class AMDCopyQueue(HWQueue):
 
     return self
 
-  def wait(self, signal:AMDSignal, value:sint=0):
+  def wait(self, signal:AMDSignal, value:sint=0, interval=0x04):
     self.q(self.sdma.SDMA_OP_POLL_REGMEM | self.sdma.SDMA_PKT_POLL_REGMEM_HEADER_FUNC(WAIT_REG_MEM_FUNCTION_GEQ) | \
            self.sdma.SDMA_PKT_POLL_REGMEM_HEADER_MEM_POLL(1), *data64_le(signal.value_addr), value, 0xffffffff,
-           self.sdma.SDMA_PKT_POLL_REGMEM_DW5_INTERVAL(0x04) | self.sdma.SDMA_PKT_POLL_REGMEM_DW5_RETRY_COUNT(0xfff))
+           self.sdma.SDMA_PKT_POLL_REGMEM_DW5_INTERVAL(interval) | self.sdma.SDMA_PKT_POLL_REGMEM_DW5_RETRY_COUNT(0xfff))
     return self
 
   def timestamp(self, signal:AMDSignal):
@@ -509,13 +509,15 @@ class AMDCopyQueue(HWQueue):
     self.q(self.sdma.SDMA_OP_WRITE, *data64_le(b.va_addr), 1 if b64 else 0, lo32(val), *([hi32(val)] if b64 else []))
     return self
 
-  def bind(self, dev:AMDDevice):
-    if not getenv("AMD_SDMA_BIND", 0) or not dev.is_am(): return
+  def bind(self, dev:AMDDevice, force=False):
+    if not (force or getenv("AMD_SDMA_BIND", 0)) or not dev.is_am(): return
 
     self.binded_device = dev
     self.hw_page = dev.allocator.alloc((qsz:=round_up(len(self._q), 8)) * 4, BufferSpec(cpu_access=True, nolru=True, uncached=True))
     hw_view = self.hw_page.cpu_view().view(fmt='I')
-    for i in range(qsz): hw_view[i] = self._q[i] if i < len(self._q) else 0
+    cmds = array.array('I', self._q)
+    cmds.extend([0] * (qsz - len(cmds)))
+    hw_view[:] = cmds
 
     self.indirect_cmd = [self.sdma.SDMA_OP_INDIRECT | self.sdma.SDMA_PKT_INDIRECT_HEADER_VMID(0), *data64_le(self.hw_page.va_addr), qsz,
                          *data64_le(0)]
@@ -666,6 +668,33 @@ class AMDAllocator(HCQAllocator['AMDDevice']):
                                   .write(self.dev.iface.cq_buf.offset(12), 0) \
                                   .signal(self.dev.timeline_signal, self.dev.next_timeline()).submit(self.dev)
         dest.cast('B')[i:i+lsize] = self.b[0].cpu_view().view(size=lsize, fmt='B')[:]
+
+  def _copyin_stream(self, dests:list[tuple[HCQBuffer, int]], srcs:Iterable[memoryview]):
+    assert self.dev.is_usb() and self.dev.iface.pci_dev.usb.usb.is_custom
+    staging, flags = self.b[0], self.dev.iface.cq_buf
+    ready = AMDSignal(flags.offset(0, 4), virt=True)
+    usb = self.dev.iface.pci_dev.usb
+    sources = iter(srcs)
+    # Reset before the firmware's ready signal crosses a byte boundary.
+    for start in range(0, len(dests), 0xff):
+      batch = dests[start:start+0xff]
+      queue = AMDCopyQueue(self.dev)
+      for i, (dest, size) in enumerate(batch, 1):
+        assert size <= staging.size
+        queue.wait(ready, i, interval=0xffff).copy(dest, staging, size).write(flags.offset(4, 4), i)
+      queue.signal(self.dev.timeline_signal, self.dev.next_timeline())
+      queue.bind(self.dev, force=True)
+
+      usb.stream_start()
+      queue.submit(self.dev)
+      for _, size in batch:
+        src = next(sources)
+        assert src.nbytes == size
+        usb.scsi_write_data(src)
+        usb.stream_signal()
+      usb.stream_finish()
+      self.dev.timeline_signal.wait(self.dev.timeline_value - 1)
+    assert next(sources, None) is None
 
 @dataclass
 class AMDQueueDesc:

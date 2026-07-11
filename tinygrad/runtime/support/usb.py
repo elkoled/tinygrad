@@ -1,7 +1,7 @@
 import ctypes, struct, dataclasses, array, itertools, time, functools
 from typing import Sequence
 from tinygrad.runtime.autogen import libusb
-from tinygrad.helpers import DEBUG, DEV, to_mv, round_up, OSX, getenv, ceildiv
+from tinygrad.helpers import DEBUG, DEV, from_mv, to_mv, round_up, OSX, getenv, ceildiv
 from tinygrad.runtime.support.hcq import MMIOInterface
 from tinygrad.runtime.support import c
 
@@ -106,10 +106,14 @@ class USB3:
         if tr.contents.status == libusb.LIBUSB_TRANSFER_COMPLETED: running -= 1
         elif tr.contents.status != 0xFF: raise RuntimeError(f"EP 0x{tr.contents.endpoint:02X} error: {tr.contents.status}")
 
-  def _bulk_out(self, ep: int, payload: bytes, timeout: int = 1000):
-    if len(payload) > len(self._bulk_out_mv): self._bulk_out_buf, self._bulk_out_mv = alloc_cbuffer(len(payload))
-    self._bulk_out_mv[:len(payload)] = payload
-    checked(libusb.libusb_bulk_transfer, f"bulk OUT 0x{ep:02X} failed")(self.handle, ep, self._bulk_out_buf, len(payload), self._transferred, timeout)
+  def _bulk_out(self, ep: int, payload: bytes|memoryview, timeout: int = 1000):
+    payload = memoryview(payload).cast('B')
+    try: buf = from_mv(payload, ctypes.c_ubyte)
+    except TypeError:
+      if len(payload) > len(self._bulk_out_mv): self._bulk_out_buf, self._bulk_out_mv = alloc_cbuffer(len(payload))
+      self._bulk_out_mv[:len(payload)] = payload
+      buf = self._bulk_out_buf
+    checked(libusb.libusb_bulk_transfer, f"bulk OUT 0x{ep:02X} failed")(self.handle, ep, buf, len(payload), self._transferred, timeout)
     assert self._transferred.value == len(payload), f"bulk OUT short write on 0x{ep:02X}: {self._transferred.value}/{len(payload)} bytes"
 
   def _bulk_in(self, ep: int, length: int, timeout: int = 1000) -> memoryview:
@@ -291,15 +295,37 @@ class CustomASM24Controller:
       checked(libusb.libusb_control_transfer,
               f"write(0x{base_addr + off:04X}, 0x{val:02X}) failed")(self.usb.handle, 0x40, 0xE5, base_addr + off, val, None, 0, 1000)
 
-  def scsi_write(self, buf:bytes, lba:int=0):
+  def scsi_write_data(self, buf:memoryview, lba:int=0):
     """Write to SRAM via 0xF2 vendor command + bulk OUT."""
-    buf_padded = buf + b'\x00' * (round_up(len(buf), 512) - len(buf))
-    sectors = len(buf_padded) // 512
-    num_slots = round_up(len(buf_padded), 0x4000) // 0x4000  # 16KB per slot
+    buf = memoryview(buf).cast('B')
+    if len(buf) % 512:
+      padded = bytearray(round_up(len(buf), 512))
+      padded[:len(buf)] = buf
+      buf = memoryview(padded)
+    sectors = len(buf) // 512
+    num_slots = round_up(len(buf), 0x4000) // 0x4000  # 16KB per slot
     # 0xF2 OUT: wValue=sectors, wIndex=start_slot|(num_slots<<8)
     windex = (num_slots & 0xFF) << 8
     checked(libusb.libusb_control_transfer, "F2 setup failed")(self.usb.handle, 0x40, 0xF2, sectors, windex, None, 0, 1000)
-    self.usb._bulk_out(0x02, buf_padded)
+    self.usb._bulk_out(0x02, buf)
+
+  def scsi_write(self, buf:bytes, lba:int=0): self.scsi_write_data(memoryview(buf), lba)
+
+  def stream_status(self):
+    status = (ctypes.c_ubyte * 1)()
+    checked(libusb.libusb_control_transfer, "stream status failed")(self.usb.handle, 0xC0, 0xF4, 0, 0, status, 1, 1000)
+    if status[0]: raise RuntimeError("GPU upload stream failed")
+
+  def stream_start(self):
+    checked(libusb.libusb_control_transfer, "stream start failed")(self.usb.handle, 0x40, 0xF4, 1, 0, None, 0, 1000)
+    self.stream_status()
+
+  def stream_finish(self):
+    checked(libusb.libusb_control_transfer, "stream finish failed")(self.usb.handle, 0x40, 0xF4, 0, 0, None, 0, 5000)
+    self.stream_status()
+
+  def stream_signal(self):
+    checked(libusb.libusb_control_transfer, "stream signal failed")(self.usb.handle, 0x40, 0xF5, 0, 0, None, 0, 1000)
 
   def scsi_read_arm(self, size:int):
     windex = (ceildiv(size, 0x4000) & 0xFF) << 8
@@ -463,12 +489,16 @@ class USBMMIOInterface(MMIOInterface):
       return bytes(array.array(acc, [self._acc_one(off + i * acc_size, acc_size) for i in range(sz // acc_size)]))
 
     # write op
-    data = struct.pack(self.fmt, data) if isinstance(data, int) else bytes(data)
+    if isinstance(data, int): data = struct.pack(self.fmt, data)
+    try: data = memoryview(data).cast('B')
+    except TypeError: data = memoryview(bytes(data))
 
     if not self.pcimem:
       # Fast path for writing into buffer 0xf000
       use_cache = 0xa800 <= self.addr <= 0xb000
-      return self.usb.scsi_write(bytes(data)) if self.addr == 0xf000 else self.usb.write(self.addr + off, bytes(data), ignore_cache=not use_cache)
+      if self.addr == 0xf000:
+        return self.usb.scsi_write_data(data) if hasattr(self.usb, 'scsi_write_data') else self.usb.scsi_write(bytes(data))
+      return self.usb.write(self.addr + off, bytes(data), ignore_cache=not use_cache)
 
     _, acc_sz = self._acc_size(len(data) * struct.calcsize(self.fmt))
     self.usb.pcie_mem_write(self.addr+off, [int.from_bytes(data[i:i+acc_sz], "little") for i in range(0, len(data), acc_sz)], acc_sz)

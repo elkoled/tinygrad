@@ -101,5 +101,15 @@ class TestUSBMMIOInterface(unittest.TestCase):
     self.assertEqual(list(raw), values)
     self.assertEqual([mmio_pci[i] for i in range(4, 7)], values)
 
+  def test_sram_bulk_write(self):
+    class BulkUSB(MockUSB):
+      def scsi_write_data(self, data): self.data = data
+
+    usb = BulkUSB(bytearray(self.size))
+    mmio = USBMMIOInterface(usb, 0xf000, self.size, fmt='B', pcimem=False)
+    data = bytearray([1, 2, 3, 4])
+    mmio[:4] = data
+    self.assertIs(usb.data.obj, data)
+
 if __name__ == "__main__":
   unittest.main()
