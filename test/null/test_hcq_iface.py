@@ -101,5 +101,14 @@ class TestUSBMMIOInterface(unittest.TestCase):
     self.assertEqual(list(raw), values)
     self.assertEqual([mmio_pci[i] for i in range(4, 7)], values)
 
+  def test_pcimem_bulk_write(self):
+    class BulkUSB(MockUSB):
+      def pcie_mem_write_data(self, address, data): self.mem[address:address+len(data)] = data
+
+    usb = BulkUSB(bytearray(self.size))
+    mmio_pci = USBMMIOInterface(usb, 0, self.size, fmt='B', pcimem=True)
+    mmio_pci[4:8] = [1, 2, 3, 4]
+    self.assertEqual(list(usb.mem[4:8]), [1, 2, 3, 4])
+
 if __name__ == "__main__":
   unittest.main()

@@ -1,7 +1,7 @@
 import ctypes, struct, dataclasses, array, itertools, time, functools
 from typing import Sequence
 from tinygrad.runtime.autogen import libusb
-from tinygrad.helpers import DEBUG, DEV, to_mv, round_up, OSX, getenv, ceildiv
+from tinygrad.helpers import DEBUG, DEV, from_mv, to_mv, round_up, OSX, getenv, ceildiv
 from tinygrad.runtime.support.hcq import MMIOInterface
 from tinygrad.runtime.support import c
 
@@ -106,10 +106,14 @@ class USB3:
         if tr.contents.status == libusb.LIBUSB_TRANSFER_COMPLETED: running -= 1
         elif tr.contents.status != 0xFF: raise RuntimeError(f"EP 0x{tr.contents.endpoint:02X} error: {tr.contents.status}")
 
-  def _bulk_out(self, ep: int, payload: bytes, timeout: int = 1000):
-    if len(payload) > len(self._bulk_out_mv): self._bulk_out_buf, self._bulk_out_mv = alloc_cbuffer(len(payload))
-    self._bulk_out_mv[:len(payload)] = payload
-    checked(libusb.libusb_bulk_transfer, f"bulk OUT 0x{ep:02X} failed")(self.handle, ep, self._bulk_out_buf, len(payload), self._transferred, timeout)
+  def _bulk_out(self, ep: int, payload: bytes|memoryview, timeout: int = 1000):
+    payload = memoryview(payload).cast('B')
+    try: buf = from_mv(payload, ctypes.c_ubyte)
+    except TypeError:
+      if len(payload) > len(self._bulk_out_mv): self._bulk_out_buf, self._bulk_out_mv = alloc_cbuffer(len(payload))
+      self._bulk_out_mv[:len(payload)] = payload
+      buf = self._bulk_out_buf
+    checked(libusb.libusb_bulk_transfer, f"bulk OUT 0x{ep:02X} failed")(self.handle, ep, buf, len(payload), self._transferred, timeout)
     assert self._transferred.value == len(payload), f"bulk OUT short write on 0x{ep:02X}: {self._transferred.value}/{len(payload)} bytes"
 
   def _bulk_in(self, ep: int, length: int, timeout: int = 1000) -> memoryview:
@@ -266,6 +270,13 @@ class CustomASM24Controller:
     if not values: return
     self._f0_out(0x60, 0x0F, address, len(values), mode=1)
     self.usb._bulk_out(0x02, struct.pack(f'<{len(values)}I', *values))
+
+  def pcie_mem_write_data(self, address:int, data:memoryview):
+    """Streaming PCIe memory write from a contiguous little-endian buffer."""
+    assert data.nbytes % 4 == 0, f"pcie_mem_write_data requires 4-byte aligned size, got {data.nbytes}"
+    if not data.nbytes: return
+    self._f0_out(0x60, 0x0F, address, data.nbytes // 4, mode=1)
+    self.usb._bulk_out(0x02, data.cast('B'))
 
   def pcie_mem_read(self, address:int, nbytes:int) -> bytes:
     """Streaming PCIe memory read via 0xF0 mode 2 + bulk IN. Returns little-endian bytes."""
@@ -463,12 +474,17 @@ class USBMMIOInterface(MMIOInterface):
       return bytes(array.array(acc, [self._acc_one(off + i * acc_size, acc_size) for i in range(sz // acc_size)]))
 
     # write op
-    data = struct.pack(self.fmt, data) if isinstance(data, int) else bytes(data)
+    if isinstance(data, int): data = struct.pack(self.fmt, data)
+    try: data = memoryview(data).cast('B')
+    except TypeError: data = memoryview(bytes(data))
 
     if not self.pcimem:
       # Fast path for writing into buffer 0xf000
       use_cache = 0xa800 <= self.addr <= 0xb000
       return self.usb.scsi_write(bytes(data)) if self.addr == 0xf000 else self.usb.write(self.addr + off, bytes(data), ignore_cache=not use_cache)
+
+    if hasattr(self.usb, 'pcie_mem_write_data') and len(data) % 4 == 0:
+      return self.usb.pcie_mem_write_data(self.addr + off, data)
 
     _, acc_sz = self._acc_size(len(data) * struct.calcsize(self.fmt))
     self.usb.pcie_mem_write(self.addr+off, [int.from_bytes(data[i:i+acc_sz], "little") for i in range(0, len(data), acc_sz)], acc_sz)
