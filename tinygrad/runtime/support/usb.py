@@ -1,4 +1,4 @@
-import ctypes, struct, dataclasses, array, itertools, time, functools
+import ctypes, struct, dataclasses, array, itertools, time, functools, contextlib
 from typing import Sequence
 from tinygrad.runtime.autogen import libusb
 from tinygrad.helpers import DEBUG, DEV, from_mv, to_mv, round_up, OSX, getenv, ceildiv
@@ -115,6 +115,26 @@ class USB3:
       buf = self._bulk_out_buf
     checked(libusb.libusb_bulk_transfer, f"bulk OUT 0x{ep:02X} failed")(self.handle, ep, buf, len(payload), self._transferred, timeout)
     assert self._transferred.value == len(payload), f"bulk OUT short write on 0x{ep:02X}: {self._transferred.value}/{len(payload)} bytes"
+
+  @contextlib.contextmanager
+  def dma_buffers(self, count:int, size:int):
+    buffers = []
+    try:
+      for _ in range(count):
+        if not (ptr:=libusb.libusb_dev_mem_alloc(self.handle, size)): break
+        buffers.append((ptr, to_mv(ctypes.addressof(ptr.contents), size)))
+      if len(buffers) == count:
+        yield [buf for _, buf in buffers]
+      else:
+        for ptr, buf in buffers:
+          buf.release()
+          checked(libusb.libusb_dev_mem_free)(self.handle, ptr, size)
+        buffers.clear()
+        yield [memoryview(bytearray(size)) for _ in range(count)]
+    finally:
+      for ptr, buf in buffers:
+        buf.release()
+        checked(libusb.libusb_dev_mem_free)(self.handle, ptr, size)
 
   def _bulk_in(self, ep: int, length: int, timeout: int = 1000) -> memoryview:
     if length > len(self._bulk_in_mv): self._bulk_in_buf, self._bulk_in_mv = alloc_cbuffer(length)
@@ -297,17 +317,25 @@ class CustomASM24Controller:
 
   def scsi_write_data(self, buf:memoryview, lba:int=0):
     """Write to SRAM via 0xF2 vendor command + bulk OUT."""
-    buf = memoryview(buf).cast('B')
-    if len(buf) % 512:
-      padded = bytearray(round_up(len(buf), 512))
-      padded[:len(buf)] = buf
-      buf = memoryview(padded)
+    buf = self._sector_data(buf)
     sectors = len(buf) // 512
     num_slots = round_up(len(buf), 0x4000) // 0x4000  # 16KB per slot
     # 0xF2 OUT: wValue=sectors, wIndex=start_slot|(num_slots<<8)
     windex = (num_slots & 0xFF) << 8
     checked(libusb.libusb_control_transfer, "F2 setup failed")(self.usb.handle, 0x40, 0xF2, sectors, windex, None, 0, 1000)
     self.usb._bulk_out(0x02, buf)
+
+  @staticmethod
+  def _sector_data(buf:memoryview):
+    buf = memoryview(buf).cast('B')
+    if len(buf) % 512:
+      padded = bytearray(round_up(len(buf), 512))
+      padded[:len(buf)] = buf
+      buf = memoryview(padded)
+    return buf
+
+  def stream_write_data(self, buf:memoryview, timeout=1000):
+    self.usb._bulk_out(0x02, self._sector_data(buf), timeout)
 
   def scsi_write(self, buf:bytes, lba:int=0): self.scsi_write_data(memoryview(buf), lba)
 
@@ -316,16 +344,19 @@ class CustomASM24Controller:
     checked(libusb.libusb_control_transfer, "stream status failed")(self.usb.handle, 0xC0, 0xF4, 0, 0, status, 1, 1000)
     if status[0]: raise RuntimeError("GPU upload stream failed")
 
-  def stream_start(self):
-    checked(libusb.libusb_control_transfer, "stream start failed")(self.usb.handle, 0x40, 0xF4, 1, 0, None, 0, 1000)
+  def stream_start(self, cyclic=True):
+    checked(libusb.libusb_control_transfer, "stream start failed")(self.usb.handle, 0x40, 0xF4, 1 if cyclic else 2, 0, None, 0, 1000)
     self.stream_status()
 
   def stream_finish(self):
     checked(libusb.libusb_control_transfer, "stream finish failed")(self.usb.handle, 0x40, 0xF4, 0, 0, None, 0, 5000)
     self.stream_status()
 
-  def stream_signal(self):
-    checked(libusb.libusb_control_transfer, "stream signal failed")(self.usb.handle, 0x40, 0xF5, 0, 0, None, 0, 1000)
+  def stream_signal(self, rearm=False, wait=False, pipeline=False, next_size=0):
+    assert sum((rearm, wait, pipeline)) <= 1
+    mode = 3 if pipeline else 1 if rearm else 2 if wait else 0
+    sectors = ceildiv(next_size, 512) if pipeline else 0
+    checked(libusb.libusb_control_transfer, "stream signal failed")(self.usb.handle, 0x40, 0xF5, mode, sectors, None, 0, 5000)
 
   def scsi_read_arm(self, size:int):
     windex = (ceildiv(size, 0x4000) & 0xFF) << 8

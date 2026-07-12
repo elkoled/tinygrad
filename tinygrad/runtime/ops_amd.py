@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import cast, Iterable
+from typing import cast, Callable, Iterable
 import os, ctypes, struct, hashlib, functools, importlib, mmap, errno, array, contextlib, sys, weakref, itertools, collections, atexit
 assert sys.platform != 'win32'
 from dataclasses import dataclass
@@ -669,32 +669,35 @@ class AMDAllocator(HCQAllocator['AMDDevice']):
                                   .signal(self.dev.timeline_signal, self.dev.next_timeline()).submit(self.dev)
         dest.cast('B')[i:i+lsize] = self.b[0].cpu_view().view(size=lsize, fmt='B')[:]
 
-  def _copyin_stream(self, dests:list[tuple[HCQBuffer, int]], srcs:Iterable[memoryview]):
+  def _copyin_stream(self, dests:list[tuple[HCQBuffer, int]], srcs:Callable[[list[memoryview]], Iterable[memoryview]]):
     assert self.dev.is_usb() and self.dev.iface.pci_dev.usb.usb.is_custom
     staging, flags = self.b[0], self.dev.iface.cq_buf
+    chunk_size = staging.size // 2
     ready = AMDSignal(flags.offset(0, 4), virt=True)
     usb = self.dev.iface.pci_dev.usb
-    sources = iter(srcs)
-    # Reset before the firmware's ready signal crosses a byte boundary.
-    for start in range(0, len(dests), 0xff):
-      batch = dests[start:start+0xff]
-      queue = AMDCopyQueue(self.dev)
-      for i, (dest, size) in enumerate(batch, 1):
-        assert size <= staging.size
-        queue.wait(ready, i, interval=0xffff).copy(dest, staging, size).write(flags.offset(4, 4), i)
-      queue.signal(self.dev.timeline_signal, self.dev.next_timeline())
-      queue.bind(self.dev, force=True)
+    with usb.usb.dma_buffers(2, chunk_size) as buffers:
+      sources = iter(srcs(buffers))
+      try:
+        queue = AMDCopyQueue(self.dev)
+        for i, (dest, size) in enumerate(dests, 1):
+          assert size <= chunk_size
+          queue.wait(ready, i, interval=0x1000).copy(dest, staging.offset((i - 1) % 2 * chunk_size), size).write(flags.offset(4, 4), i)
+        queue.signal(self.dev.timeline_signal, self.dev.next_timeline())
+        queue.bind(self.dev, force=True)
 
-      usb.stream_start()
-      queue.submit(self.dev)
-      for _, size in batch:
-        src = next(sources)
-        assert src.nbytes == size
-        usb.scsi_write_data(src)
-        usb.stream_signal()
-      usb.stream_finish()
-      self.dev.timeline_signal.wait(self.dev.timeline_value - 1)
-    assert next(sources, None) is None
+        usb.stream_start(cyclic=False)
+        queue.submit(self.dev)
+        for i, (_, size) in enumerate(dests):
+          src = next(sources)
+          assert src.nbytes == size
+          (usb.scsi_write_data if i == 0 else usb.stream_write_data)(src)
+          try: usb.stream_signal(pipeline=i + 1 < len(dests), wait=i + 1 == len(dests), next_size=dests[i + 1][1] if i + 1 < len(dests) else 0)
+          except RuntimeError as e: raise RuntimeError(f"USB stream failed at chunk {i}") from e
+        usb.stream_finish()
+        self.dev.timeline_signal.wait(self.dev.timeline_value - 1)
+        assert next(sources, None) is None
+      finally:
+        if callable(close:=getattr(sources, "close", None)): close()
 
 @dataclass
 class AMDQueueDesc:
