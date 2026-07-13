@@ -671,10 +671,11 @@ class AMDAllocator(HCQAllocator['AMDDevice']):
 
   def _copyin_stream(self, dests:list[tuple[HCQBuffer, int]], srcs:Callable[[list[memoryview]], Iterable[memoryview]]):
     assert self.dev.is_usb() and self.dev.iface.pci_dev.usb.usb.is_custom
+    usb = self.dev.iface.pci_dev.usb
+    if not usb.supports_stream(): raise RuntimeError("USB upload streaming is not supported")
     staging, flags = self.b[0], self.dev.iface.cq_buf
     chunk_size = staging.size // 2
     ready = AMDSignal(flags.offset(0, 4), virt=True)
-    usb = self.dev.iface.pci_dev.usb
     with usb.usb.dma_buffers(2, chunk_size) as buffers:
       sources = iter(srcs(buffers))
       try:

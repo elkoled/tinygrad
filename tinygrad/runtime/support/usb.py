@@ -339,6 +339,10 @@ class CustomASM24Controller:
 
   def scsi_write(self, buf:bytes, lba:int=0): self.scsi_write_data(memoryview(buf), lba)
 
+  def supports_stream(self):
+    status = (ctypes.c_ubyte * 1)()
+    return libusb.libusb_control_transfer(self.usb.handle, 0xC0, 0xF4, 0, 0, status, 1, 100) == 1
+
   def stream_status(self):
     status = (ctypes.c_ubyte * 1)()
     checked(libusb.libusb_control_transfer, "stream status failed")(self.usb.handle, 0xC0, 0xF4, 0, 0, status, 1, 1000)
