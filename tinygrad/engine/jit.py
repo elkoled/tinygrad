@@ -288,9 +288,13 @@ class _TinyJit(Generic[ReturnType]):
     self.cnt += 1
     return ret
 
-# overload signatures support both @TinyJit and @TinyJit(prune=True) syntax
+# overload signatures support both @TinyJit and @TinyJit(prune=True) syntax, plus legacy pickle reconstruction
 @overload
 def TinyJit(fxn:Callable[..., ReturnType], *, prune:bool=False) -> _TinyJit[ReturnType]: ...
 @overload
+def TinyJit(fxn:None, captured:CapturedJit, *, prune:bool=False) -> _TinyJit[ReturnType]: ...
+@overload
 def TinyJit(fxn:None=None, *, prune:bool=False) -> Callable[[Callable[..., ReturnType]], _TinyJit[ReturnType]]: ...
-def TinyJit(fxn=None, **kwargs): return (lambda f: _TinyJit(f, **kwargs)) if fxn is None else _TinyJit(fxn, **kwargs)
+def TinyJit(fxn=None, captured=None, **kwargs):
+  if captured is not None: return _TinyJit(fxn, captured, **kwargs)
+  return (lambda f: _TinyJit(f, **kwargs)) if fxn is None else _TinyJit(fxn, **kwargs)
