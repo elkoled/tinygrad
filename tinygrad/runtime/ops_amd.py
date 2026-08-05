@@ -556,6 +556,7 @@ class AMDCopyQueue(HWQueue):
       sdma_queue.put_value += rem_packet_cnt * 4
 
     sdma_queue.signal_doorbell(dev)
+    if dev.is_usb(): sdma_queue.signal_doorbell(dev)
 
 class AMDProgram(HCQProgram['AMDDevice']):
   def __init__(self, dev:AMDDevice, obj:TinyELF):
