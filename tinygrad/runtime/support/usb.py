@@ -70,6 +70,7 @@ class USB3:
     checked(libusb.libusb_set_interface_alt_setting)(self.handle, 0, 0)
 
   def reopen(self, delay=0):
+    checked(libusb.libusb_reset_device)(self.handle)
     libusb.libusb_release_interface(self.handle, 0)
     libusb.libusb_close(self.handle)
     self.handle, last_error = None, None
