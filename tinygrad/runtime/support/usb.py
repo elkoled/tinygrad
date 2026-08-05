@@ -12,6 +12,8 @@ class USBError(RuntimeError):
     super().__init__(f"{msg}: {ctypes.string_at(libusb.libusb_strerror(rc)).decode()}")
     self.rc = rc
 
+class USBIntegrityError(RuntimeError): pass
+
 def checked(fn, msg=None):
   @functools.wraps(fn)
   def wrapper(*args):
@@ -40,7 +42,7 @@ class USB3:
 
   def __init__(self, dev:c.POINTER[libusb.struct_libusb_device], *args, **kwargs):
     self.dev = dev
-    self._tags, self._transferred = itertools.count(1), ctypes.c_int(0)
+    self._tags, self._transferred, self.recovery_generation = itertools.count(1), ctypes.c_int(0), 0
     self._bulk_buf, self._bulk_mv = alloc_cbuffer(4 << 20)
     self._ctrl_buf, self._ctrl_mv = alloc_cbuffer(0x1000)
     self._open(True)
@@ -85,6 +87,7 @@ class USB3:
       except USBError as error:
         if error.rc not in (libusb.LIBUSB_ERROR_IO, libusb.LIBUSB_ERROR_TIMEOUT) or delay is None: raise
         self.reopen(delay)
+        self.recovery_generation += 1
         recover()
 
   def control_write(self, request:int, value:int=0, index:int=0, data:bytes=b'', timeout:int=1000):
@@ -102,11 +105,14 @@ class USB3:
     self._bulk_mv[:len(payload)] = payload
     checked(libusb.libusb_bulk_transfer, "bulk OUT 0x02 failed") \
       (self.handle, 0x02, self._bulk_buf, len(payload), self._transferred, timeout)
-    assert self._transferred.value == len(payload), f"bulk OUT short write: {self._transferred.value}/{len(payload)} bytes"
+    if self._transferred.value != len(payload):
+      raise USBError(f"bulk OUT short write: {self._transferred.value}/{len(payload)} bytes", libusb.LIBUSB_ERROR_IO)
 
   def bulk_read(self, length:int, timeout:int=1000) -> memoryview:
     if length > len(self._bulk_mv): self._bulk_buf, self._bulk_mv = alloc_cbuffer(length)
     checked(libusb.libusb_bulk_transfer, "bulk IN 0x81 failed")(self.handle, 0x81, self._bulk_buf, length, self._transferred, timeout)
+    if self._transferred.value != length:
+      raise USBError(f"bulk IN short read: {self._transferred.value}/{length} bytes", libusb.LIBUSB_ERROR_IO)
     return self._bulk_mv[:self._transferred.value]
 
   # NOTE: keep it for flash.py

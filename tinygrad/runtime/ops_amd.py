@@ -17,7 +17,7 @@ from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.support.am.amdev import AMDev, AMMemoryManager
 from tinygrad.runtime.support.amd import AMDReg, AMDIP, import_module, import_soc, import_pmc
 from tinygrad.runtime.support.system import System, PCIIfaceBase, PCIAllocationMeta, USBPCIDevice, MAP_FIXED, MAP_NORESERVE
-from tinygrad.runtime.support.usb import USB3
+from tinygrad.runtime.support.usb import USB3, USBIntegrityError
 from tinygrad.runtime.support.memory import AddrSpace
 if getenv("IOCTL"): import extra.hip_gpu_driver.hip_ioctl  # noqa: F401 # pylint: disable=unused-import
 
@@ -650,8 +650,23 @@ class AMDAllocator(HCQAllocator['AMDDevice']):
 
   def _do_map(self, buf:HCQBuffer): return self.dev.iface.map(buf._base if buf._base is not None else buf)
 
-  def _copyout(self, dest:memoryview, src:HCQBuffer):
-    if not self.dev.is_usb(): return super()._copyout(dest, src)
+  def _copyin_once(self, dest:HCQBuffer, src:memoryview): return super()._copyin(dest, src)
+
+  def _copyin(self, dest:HCQBuffer, src:memoryview):
+    if not self.dev.is_usb(): return self._copyin_once(dest, src)
+    usb, verify = self.dev.iface.pci_dev.usb.usb, False
+    for _ in range(3):
+      generation = usb.recovery_generation
+      self._copyin_once(dest, src)
+      verify |= usb.recovery_generation != generation
+      if not verify: return
+
+      check, generation = bytearray(src.nbytes), usb.recovery_generation
+      self._copyout_once(memoryview(check), dest)
+      if usb.recovery_generation == generation and memoryview(check) == src: return
+    raise USBIntegrityError("recovered USB copyin failed verification")
+
+  def _copyout_once(self, dest:memoryview, src:HCQBuffer):
     self.dev.synchronize()
 
     with hcq_profile(self.dev, queue_type=self.dev.hw_copy_queue_t, desc=TracingKey(f"{self.dev.device} -> TINY", ret=dest.nbytes), enabled=PROFILE,
@@ -668,6 +683,23 @@ class AMDAllocator(HCQAllocator['AMDDevice']):
           self.dev.hw_copy_queue_t().write(self.dev.iface.cq_buf.offset(12), 0).submit(self.dev)
         def read(): dest.cast('B')[i:i+lsize] = self.b[0].cpu_view().view(size=lsize, fmt='B')[:]
         controller.usb.retry(read, recover)
+
+  def _copyout(self, dest:memoryview, src:HCQBuffer):
+    if not self.dev.is_usb(): return super()._copyout(dest, src)
+    usb, generation = self.dev.iface.pci_dev.usb.usb, self.dev.iface.pci_dev.usb.usb.recovery_generation
+    self._copyout_once(dest, src)
+    if usb.recovery_generation == generation: return
+
+    previous = None
+    for _ in range(3):
+      check, generation = bytearray(dest.nbytes), usb.recovery_generation
+      self._copyout_once(memoryview(check), src)
+      if usb.recovery_generation != generation: continue
+      if previous is not None and check == previous:
+        dest.cast('B')[:] = check
+        return
+      previous = check
+    raise USBIntegrityError("recovered USB copyout failed verification")
 
 @dataclass
 class AMDQueueDesc:
