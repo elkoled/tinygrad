@@ -656,12 +656,17 @@ class AMDAllocator(HCQAllocator['AMDDevice']):
     with hcq_profile(self.dev, queue_type=self.dev.hw_copy_queue_t, desc=TracingKey(f"{self.dev.device} -> TINY", ret=dest.nbytes), enabled=PROFILE,
                      dev_suff="SDMA:0"):
       for i in range(0, dest.nbytes, cp_size:=self.b[0].size):
-        self.dev.iface.pci_dev.usb.scsi_read_arm(lsize:=min(cp_size, dest.nbytes - i))
+        controller = self.dev.iface.pci_dev.usb
+        controller.scsi_read_arm(lsize:=min(cp_size, dest.nbytes - i))
         self.dev.hw_copy_queue_t().wait(self.dev.timeline_signal, self.dev.timeline_value - 1) \
                                   .copy(self.b[0], src.offset(i), lsize) \
                                   .write(self.dev.iface.cq_buf.offset(12), 0) \
                                   .signal(self.dev.timeline_signal, self.dev.next_timeline()).submit(self.dev)
-        dest.cast('B')[i:i+lsize] = self.b[0].cpu_view().view(size=lsize, fmt='B')[:]
+        def recover():
+          controller.scsi_read_arm(lsize)
+          self.dev.hw_copy_queue_t().write(self.dev.iface.cq_buf.offset(12), 0).submit(self.dev)
+        def read(): dest.cast('B')[i:i+lsize] = self.b[0].cpu_view().view(size=lsize, fmt='B')[:]
+        controller.usb.retry(read, recover)
 
 @dataclass
 class AMDQueueDesc:

@@ -240,7 +240,7 @@ class USBPCIDevice(PCIDevice):
 
   def bar_info(self, bar_idx:int) -> tuple[int, int]: return self._bar_info[bar_idx]  # type: ignore[override]
   def map_bar(self, bar, off=0, addr=0, size=None, fmt='B'):
-    return USBMMIOInterface(self.usb, self.bar_info(bar)[0] + off, size or self.bar_info(bar)[1], fmt)
+    return USBMMIOInterface(self.usb, self.bar_info(bar)[0] + off, size or self.bar_info(bar)[1], fmt, replay_writes=bar in (0, 2))
   def resize_bar(self, bar_idx:int): pass # already resized
 
 @dataclasses.dataclass

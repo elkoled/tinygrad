@@ -4,11 +4,18 @@ from tinygrad.helpers import DEBUG, DEV, to_mv, round_up, ceildiv
 from tinygrad.runtime.support.hcq import MMIOInterface
 from tinygrad.runtime.support import c
 
+USB_RETRY_DELAYS = (0, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.05, 0.05, None)
+
 def alloc_cbuffer(sz:int) -> tuple[ctypes.Array, memoryview]: return (buf:=(ctypes.c_ubyte * sz)()), to_mv(ctypes.addressof(buf), sz)
+class USBError(RuntimeError):
+  def __init__(self, msg:str, rc:int):
+    super().__init__(f"{msg}: {ctypes.string_at(libusb.libusb_strerror(rc)).decode()}")
+    self.rc = rc
+
 def checked(fn, msg=None):
   @functools.wraps(fn)
   def wrapper(*args):
-    if (rc:=fn(*args)) < 0: raise RuntimeError(f"{msg or fn.__name__}: {ctypes.string_at(libusb.libusb_strerror(rc)).decode()}")
+    if (rc:=fn(*args)) < 0: raise USBError(msg or fn.__name__, rc)
     return rc
   return wrapper
 
@@ -32,19 +39,23 @@ class USB3:
     return ret
 
   def __init__(self, dev:c.POINTER[libusb.struct_libusb_device], *args, **kwargs):
+    self.dev = dev
     self._tags, self._transferred = itertools.count(1), ctypes.c_int(0)
     self._bulk_buf, self._bulk_mv = alloc_cbuffer(4 << 20)
     self._ctrl_buf, self._ctrl_mv = alloc_cbuffer(0x1000)
+    self._open(True)
 
-    self.handle = c.init_c_var(c.POINTER[libusb.struct_libusb_device_handle], lambda x: checked(libusb.libusb_open)(dev, x))
+  def _open(self, validate_product=False):
+    self.handle = c.init_c_var(c.POINTER[libusb.struct_libusb_device_handle], lambda x: checked(libusb.libusb_open)(self.dev, x))
 
     # Read product string descriptor
-    _buf = (ctypes.c_ubyte * 256)()
-    _desc = libusb.struct_libusb_device_descriptor()
-    checked(libusb.libusb_get_device_descriptor)(libusb.libusb_get_device(self.handle), ctypes.byref(_desc))
-    _ret = checked(libusb.libusb_get_string_descriptor_ascii)(self.handle, _desc.iProduct, _buf, 256)
-    self.product = bytes(_buf[:_ret]).decode("ascii", errors="replace")
-    assert self.product.startswith("custom") or self.product.startswith("AS2462")
+    if validate_product:
+      _buf = (ctypes.c_ubyte * 256)()
+      _desc = libusb.struct_libusb_device_descriptor()
+      checked(libusb.libusb_get_device_descriptor)(libusb.libusb_get_device(self.handle), ctypes.byref(_desc))
+      _ret = checked(libusb.libusb_get_string_descriptor_ascii)(self.handle, _desc.iProduct, _buf, 256)
+      self.product = bytes(_buf[:_ret]).decode("ascii", errors="replace")
+      assert self.product.startswith("custom") or self.product.startswith("AS2462")
 
     # Detach kernel driver if needed
     if checked(libusb.libusb_kernel_driver_active)(self.handle, 0):
@@ -55,6 +66,26 @@ class USB3:
     checked(libusb.libusb_set_configuration)(self.handle, 1)
     checked(libusb.libusb_claim_interface)(self.handle, 0)
     checked(libusb.libusb_set_interface_alt_setting)(self.handle, 0, 0)
+
+  def reopen(self, delay=0):
+    libusb.libusb_release_interface(self.handle, 0)
+    libusb.libusb_close(self.handle)
+    self.handle, last_error = None, None
+    for wait in (delay, 0.05, 0.25):
+      time.sleep(wait)
+      try: return self._open()
+      except USBError as error:
+        if self.handle is not None: libusb.libusb_close(self.handle)
+        self.handle, last_error = None, error
+    raise last_error
+
+  def retry(self, fxn, recover=lambda: None):
+    for delay in USB_RETRY_DELAYS:
+      try: return fxn()
+      except USBError as error:
+        if error.rc not in (libusb.LIBUSB_ERROR_IO, libusb.LIBUSB_ERROR_TIMEOUT) or delay is None: raise
+        self.reopen(delay)
+        recover()
 
   def control_write(self, request:int, value:int=0, index:int=0, data:bytes=b'', timeout:int=1000):
     assert len(data) <= len(self._ctrl_mv)
@@ -153,7 +184,7 @@ class CustomASM24Controller:
     result = b''
     for off in range(0, length, 0xFF):
       chunk = min(0xFF, length - off)
-      result += self.usb.control_read(0xE4, chunk, value=base_addr + off)
+      result += self.usb.retry(lambda: self.usb.control_read(0xE4, chunk, value=base_addr + off))
     return result
 
   def write(self, base_addr:int, data:bytes):
@@ -166,18 +197,21 @@ class CustomASM24Controller:
     sectors = len(buf_padded) // 512
     num_slots = ceildiv(len(buf_padded), 0x4000)  # 16KB per slot
     windex = (num_slots & 0xFF) << 8
-    self.usb.control_write(0xF2, value=sectors, index=windex)
-    self.usb.bulk_write(buf_padded)
+    def write():
+      self.usb.control_write(0xF2, value=sectors, index=windex)
+      self.usb.bulk_write(buf_padded)
+    self.usb.retry(write)
 
   def scsi_read_arm(self, size:int):
     windex = (ceildiv(size, 0x4000) & 0xFF) << 8
-    self.usb.control_write(0xF2, value=(ceildiv(size, 512) & 0x7FFF) | 0x8000, index=windex)
+    self.usb.retry(lambda: self.usb.control_write(0xF2, value=(ceildiv(size, 512) & 0x7FFF) | 0x8000, index=windex))
 
   def scsi_read(self, size:int) -> memoryview: return self.usb.bulk_read(round_up(size, 512), timeout=10000)[:size]
 
 class USBMMIOInterface(MMIOInterface):
-  def __init__(self, usb, addr, size, fmt, pcimem=True): # pylint: disable=super-init-not-called
-    self.usb, self.addr, self.nbytes, self.fmt, self.el_sz, self.pcimem = usb, addr, size, fmt, struct.calcsize(fmt), pcimem
+  def __init__(self, usb, addr, size, fmt, pcimem=True, replay_writes=False): # pylint: disable=super-init-not-called
+    self.usb, self.addr, self.nbytes, self.fmt, self.el_sz = usb, addr, size, fmt, struct.calcsize(fmt)
+    self.pcimem, self.replay_writes = pcimem, replay_writes
 
   def _off_from_index(self, index):
     if isinstance(index, slice): return ((index.start or 0) * self.el_sz, ((index.stop or len(self))-(index.start or 0)) * self.el_sz)
@@ -195,9 +229,11 @@ class USBMMIOInterface(MMIOInterface):
     off, _ = self._off_from_index(index)
     data = struct.pack(self.fmt, data) if isinstance(data, int) else bytes(data)
     if not self.pcimem: self.usb.scsi_write(data) if self.addr == 0xf000 else self.usb.write(self.addr + off, data)
+    elif self.replay_writes: self.usb.usb.retry(lambda: self.usb.pcie_mem_write(self.addr+off, data))
     else: self.usb.pcie_mem_write(self.addr+off, data)
 
   def view(self, offset:int=0, size:int|None=None, fmt=None):
-    return USBMMIOInterface(self.usb, self.addr+offset, self.nbytes-offset if size is None else size, fmt=fmt or self.fmt, pcimem=self.pcimem)
+    return USBMMIOInterface(self.usb, self.addr+offset, self.nbytes-offset if size is None else size, fmt=fmt or self.fmt,
+                            pcimem=self.pcimem, replay_writes=self.replay_writes)
 
 if DEV.interface.startswith("MOCK"): from test.mockgpu.usb import MockUSB3 as USB3  # type: ignore  # noqa: F811
