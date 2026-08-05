@@ -678,9 +678,12 @@ class AMDAllocator(HCQAllocator['AMDDevice']):
                                   .copy(self.b[0], src.offset(i), lsize) \
                                   .write(self.dev.iface.cq_buf.offset(12), 0) \
                                   .signal(self.dev.timeline_signal, self.dev.next_timeline()).submit(self.dev)
+        self.dev.timeline_signal.wait(self.dev.timeline_value - 1)
         def recover():
           controller.scsi_read_arm(lsize)
-          self.dev.hw_copy_queue_t().write(self.dev.iface.cq_buf.offset(12), 0).submit(self.dev)
+          self.dev.hw_copy_queue_t().write(self.dev.iface.cq_buf.offset(12), 0) \
+                                    .signal(self.dev.timeline_signal, self.dev.next_timeline()).submit(self.dev)
+          self.dev.timeline_signal.wait(self.dev.timeline_value - 1)
         def read(): dest.cast('B')[i:i+lsize] = self.b[0].cpu_view().view(size=lsize, fmt='B')[:]
         controller.usb.retry(read, recover)
 
