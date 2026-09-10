@@ -880,6 +880,8 @@ class AMDDevice(Compiled):
     # Scratch setup
     self.max_private_segment_size = 0
     self.pm_bufferize = PatternMatcher([
+      (UPat(Ops.PARAM, tag={f"{n}_compute_0" for n in ("ring", "write_ptr", "doorbell", "put_value")}, name="b"),
+       lambda ctx, b: getattr(ctx.compute_queue, b.tag.removesuffix("_compute_0"))),
       (UPat(Ops.PARAM, tag="scratch", name="b"), lambda ctx, b: ctx.scratch_buffer(b.max_numel())),
       (UPat(Ops.PARAM, tag="program", name="b"), lambda ctx, b: ctx.program_buffer(b)),
     ]) + self.pm_bufferize
