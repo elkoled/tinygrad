@@ -19,7 +19,7 @@ from tinygrad.runtime.support.hcq import FileIOInterface, MMIOInterface, hcq_fil
 from tinygrad.runtime.support.am.amdev import AMDev, AMMemoryManager
 from tinygrad.runtime.support.amd import AMDReg, AMDIP, import_module, import_soc, import_pmc
 from tinygrad.runtime.support.system import PCIIfaceBase, USBPCIDevice, MAP_FIXED, MAP_NORESERVE
-from tinygrad.runtime.support.usb import USB3, pm_usb_batch, pm_usb_lower, pm_usb_bufferize
+from tinygrad.runtime.support.usb import _host_block, USB3, pm_usb_batch, pm_usb_lower, pm_usb_bufferize
 from tinygrad.runtime.support.memory import AddrSpace
 if getenv("IOCTL"): import extra.hip_gpu_driver.hip_ioctl  # noqa: F401 # pylint: disable=unused-import
 
@@ -1066,6 +1066,9 @@ class AMDDevice(Compiled):
           Compiled.profile_events.append(ProfileSQTTEvent(self.device, tag, se, self.sqtt_trace(slot, se), itrace, k))
       self.prof_read = log[0]
     super().collect_prof()
+
+  def check_submit(self):
+    if self.is_usb and (error := _host_block(self).host.view(fmt='i')[6]): raise RuntimeError(f"USB batch failed: {error}")
 
   def on_device_hang(self): self.iface.on_device_hang()
 

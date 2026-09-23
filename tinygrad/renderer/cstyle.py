@@ -9,6 +9,7 @@ from tinygrad.dtype import dtypes, DType, AddrSpace, truncate, to_storage_scalar
 from tinygrad.renderer import Renderer
 
 base_rewrite = PatternMatcher([
+  (UPat(Ops.INS, arg=("return_if", dtypes.void), name="x"), lambda ctx,x: f"if ({ctx[x.src[0]]}) return;"),
   # local/reg buffers
   (UPat(Ops.BUFFER, name="x"), lambda ctx,x: ctx.render_buffer(x)),
 

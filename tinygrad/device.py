@@ -491,6 +491,8 @@ class Compiled:
     """
     return self.iface.count if hasattr(self, 'iface') else 1
 
+  def check_submit(self): pass
+
   def on_device_hang(self): raise RuntimeError(f"{self.device} hang detected")
 
   def on_sleep(self):

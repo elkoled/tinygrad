@@ -71,6 +71,11 @@ class PythonProgram(Program['PythonDevice']):
             else: i += 1
           else: i = self.uop_to_index[u.src[1]]
           continue
+        if u.op is Ops.INS and u.arg[0] == "return_if":
+          assert warp_size == 1
+          if src_values[0][0]: break
+          i += 1
+          continue
         if u.op is Ops.IF:
           exec_masks.append([x and y for x,y in zip(exec_masks[-1], src_values[0])])
           i += 1

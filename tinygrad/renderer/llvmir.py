@@ -136,6 +136,10 @@ base_rewrite = PatternMatcher([
    f"  br label %loop_latch_{range_str(r)}\n"
    f"loop_exit_{range_str(r)}:"),
 
+  (UPat(Ops.INS, arg=("return_if", dtypes.void), name="x"), lambda ctx,x:
+   f"  br i1 {ctx[x.src[0]]}, label %return_{ctx[x][1:]}, label %continue_{ctx[x][1:]}\n"
+   f"return_{ctx[x][1:]}:\n  ret void\ncontinue_{ctx[x][1:]}:"),
+
   # if
   (UPat(Ops.IF, name="x"), lambda ctx,x: f"  br i1 {ctx[x.src[0]]}, label %ifbody_{ctx[x][1:]}, label %ifskip_{ctx[x][1:]}\nifbody_{ctx[x][1:]}:"),
   (UPat(Ops.ENDIF, name="x"), lambda ctx,x: f"  br label %ifskip_{ctx[x.src[0]][1:]}\nifskip_{ctx[x.src[0]][1:]}:"),

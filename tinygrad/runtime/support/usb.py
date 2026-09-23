@@ -254,12 +254,13 @@ class USBMMIOInterface(MMIOInterface):
 HALF, CHUNK, SLOT = 0x40000, 0x40000 - 512, 0x4000
 
 # host memory: link, staging, zeros
-def usb_host(dev) -> UOp: return UOp.placeholder((0x180020,), dtypes.uint8, 0, device=to_tuple(dev)[0], tag="usb_host")
+def usb_host(dev) -> UOp: return UOp.placeholder((0x180020,), dtypes.uint8, 0, device=to_tuple(dev)[0], tag="usb_host", volatile=True)
 def usb_link(dev) -> UOp: return usb_host(dev)[:24].bitcast(dtypes.uint64) # [handle, context, previous batch chunks]
 def usb_stage(dev) -> UOp: return usb_host(dev)[32:32 + 2 * HALF] # host buffers for the sram halves
 
 def usb_xfer(dev, half:int) -> UOp: # one bulk OUT transfer per half
-  return UOp.placeholder((ctypes.sizeof(libusb.struct_libusb_transfer),), dtypes.uint8, 0, device=to_tuple(dev)[0], tag=f"usb_xfer{half}")
+  return UOp.placeholder((ctypes.sizeof(libusb.struct_libusb_transfer),), dtypes.uint8, 0,
+                         device=to_tuple(dev)[0], tag=f"usb_xfer{half}", volatile=True)
 
 # vram words
 def usb_vram(dev) -> UOp: return UOp.placeholder((2,), dtypes.uint32, 0, device=to_tuple(dev)[0], tag="usb_vram")
@@ -276,11 +277,19 @@ def usb_stack(dt:DType, *vals:UOp|int) -> UOp: # stack array for transfer data
   r = UOp.placeholder((max(1, len(vals)),), dt, addrspace=AddrSpace.REG)
   return r.after(*[r.index(i).store(v.cast(dt) if isinstance(v, UOp) else UOp.const(v, dt)) for i, v in enumerate(vals)])
 
-def usb_ctrl(h:UOp, rtype:int, req:int, val:UOp|int, idx:UOp|int, data:UOp, n:UOp|int, timeout:int=1000) -> UOp:
-  return ccall(libusb.libusb_control_transfer, h.index(0).load(), rtype, req, val, idx, data, n, timeout)
+def usb_check(h:UOp, ret:UOp, bad:UOp) -> UOp:
+  error = usb_host(h.device)[24:28].bitcast(dtypes.int).index(0)
+  store = error.store(bad.where(ret.ne(0).where(ret, -100).cast(dtypes.int), 0))
+  return UOp(Ops.INS, src=(bad, store), arg=("return_if", dtypes.void)).barrier()
 
-def usb_bulk(h:UOp, ep:int, data:UOp, n:UOp|int, timeout:int=10000) -> UOp: # NULL actual_length
-  return ccall(libusb.libusb_bulk_transfer, h.index(0).load(), ep, data, n, UOp.const(0, dtypes.uint64), timeout)
+def usb_ctrl(h:UOp, rtype:int, req:int, val:UOp|int, idx:UOp|int, data:UOp, n:UOp|int, timeout:int=1000) -> UOp:
+  ret = ccall(libusb.libusb_control_transfer, h.index(0).load(), rtype, req, val, idx, data, n, timeout)
+  return usb_check(h, ret, ret.ne(n))
+
+def usb_bulk(h:UOp, ep:int, data:UOp, n:UOp|int, timeout:int=10000) -> UOp:
+  count = usb_stack(dtypes.int, 0)
+  ret = ccall(libusb.libusb_bulk_transfer, h.index(0).load(), ep, data, n, count.index(0), timeout)
+  return usb_check(h, ret, ret.ne(0) | count.after(ret).index(0).load().ne(n))
 
 def usb_poke(h:UOp, addr:UOp, val:UOp) -> UOp: # 0xF0 mode 0: write a dword
   return usb_ctrl(h, 0x40, 0xF0, 0x60 | 0x0F00, 0, usb_stack(dtypes.uint64, addr, val.bitcast(dtypes.uint32).cast(dtypes.uint64)).index(0), 12, 5000)
@@ -359,14 +368,21 @@ def usb_table(chunks:list[tuple[UOp, int, int]], dev) -> UOp: # [host address, b
     rows.append((16 * i, base.bitcast(dtypes.uint8)[boff + off:boff + off + nb].getaddr(to_tuple(dev)[0])))
   return patch(table, rows + [(16 * i + 8, UOp.const(nb, dtypes.uint64)) for i, (_, _, nb) in enumerate(chunks)])
 
+def usb_check_transfer(h:UOp, xfer:UOp) -> UOp:
+  field = functools.partial(cfield, xfer.after(h), libusb.struct_libusb_transfer)
+  status = field("status").load()
+  return usb_check(h, status, status.ne(0xff) & (status.ne(0) | field("actual_length").load().ne(field("length").load())))
+
 def usb_reap(h:UOp, xfer:UOp) -> UOp: # poll while pending (0xff); idle transfers return
   loop = UOp.range(UOp(Ops.NOOP), next(UOp.unique_num), dtype=dtypes.void, src=(h,))
-  events = ccall(libusb.libusb_handle_events_timeout, h.after(loop).index(1).load(), usb_stack(dtypes.uint64, 0, 0).index(0)) # zero timeout
+  events = ccall(libusb.libusb_handle_events_timeout, h.after(loop).index(1).load(), usb_stack(dtypes.uint64, 0, 0).index(0))
+  events = usb_check(h, events, events.ne(0))
   status = cfield(xfer.after(events), libusb.struct_libusb_transfer, "status").load()
-  return status.end(loop, status.eq(0xff))
+  return usb_check_transfer(h.after(status.end(loop, status.eq(0xff))), xfer)
 
 def usb_drained(h:UOp, need:UOp) -> UOp: # wait for fence == need - 1 or need, mod 256
   loop, slot = UOp.range(UOp(Ops.NOOP), next(UOp.unique_num), dtype=dtypes.void, src=(h,)), usb_stack(dtypes.uint32)
+  for half in range(2): h = h.after(usb_check_transfer(h.after(loop), usb_xfer(h.device, half)))
   fence = slot.after(usb_ctrl(h.after(loop), 0xC0, 0xE4, rt_addr(usb_fence(h.device)), 0, slot.index(0), 1)).index(0).load() # one byte avoids tearing
   return fence.end(loop, ((need - fence.cast(dtypes.uint64)) & 0xff) > 1)
 
@@ -386,7 +402,8 @@ def usb_chunk(h:UOp, table:UOp, i:UOp, half:int, run:int) -> UOp: # send chunk i
   field = functools.partial(cfield, xfer:=xfer.after(h), libusb.struct_libusb_transfer)
   xfer = xfer.after(field("status").store(0xff), field("length").store(wire.cast(dtypes.uint)),
                     field("buffer").store(rt_addr(stage) + (end - wire).cast(dtypes.uint64)))
-  return ccall(libusb.libusb_submit_transfer, xfer.index(0))
+  ret = ccall(libusb.libusb_submit_transfer, xfer.index(0))
+  return usb_check(h, ret, ret.ne(0))
 
 def usb_copyin(h:UOp, chunks:list, run:int) -> UOp: # pipeline writes through two halves
   table, n = usb_table(chunks, h.device), len(chunks)
