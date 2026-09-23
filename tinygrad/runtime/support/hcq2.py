@@ -279,7 +279,7 @@ def _finalize_batch(ctx:BatchCtx, skip_wait:bool=False) -> UOp:
   kerns:tuple[tuple, ...] = tuple(zip([d for _, d, _ in ctx.batch], names, estimates, stamps, profile_keys))
   written_bufs = tuple(dedup(b for c, _, _ in ctx.batch for b in get_call_written_bufs(c)))
   host_deps = tuple(dedup((host, devs[0]) for call, devs, _ in ctx.batch for buf in get_call_arg_uops(call)
-                         for host in to_tuple(buf.device) if host not in ctx.queues))
+                         for host in to_tuple(buf.device) if host not in ctx.queues and not getattr(Device[devs[0]], "is_usb", False)))
   info = HCQInfo(tuple(ctx.queues), skip_wait=skip_wait, kernels=kerns, written_bufs=written_bufs,
                  estimates=sum(estimates, start=Estimates()).simplify(), host_deps=host_deps)
   return sink.call(*(ctx.slots.values() if ctx.profile else ()), aux=info)
