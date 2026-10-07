@@ -229,7 +229,7 @@ def usb_stack(dt:DType, *vals:UOp|int) -> UOp:
 def usb_fail(link:UOp, code:UOp) -> UOp: return link.index(UOp.const(5).valid(link.after(code).index(5).load().eq(0))).store(code.cast(dtypes.uint64))
 def usb_ctrl(link:UOp, rtype:int, req:int, val:UOp|int, idx:UOp|int, data:UOp, n:UOp|int, timeout:int=1000) -> UOp:
   return usb_fail(link, ccall(libusb.libusb_control_transfer, link.index(0).load(), rtype, req, val, idx, data, n, timeout).minimum(0))
-def usb_bulk(link:UOp, ep:int, data:UOp, n:UOp|int, timeout:int=1000) -> UOp: # shorter transfer fails
+def usb_bulk(link:UOp, ep:int, data:UOp, n:UOp|int, timeout:int=10000) -> UOp: # shorter transfer fails
   rc = ccall(libusb.libusb_bulk_transfer, link.index(0).load(), ep, data, n, (got:=usb_stack(dtypes.int32, 0)).index(0), timeout)
   return usb_fail(link, rc.minimum(0).minimum(-got.after(rc).index(0).load().ne(n).cast(dtypes.int)))
 
@@ -289,9 +289,10 @@ def usb_store(b:UOp, idx:UOp, v:UOp) -> UOp: # kernargs: poke on change
     return usb_patch(link, addr, v, patch(cache, [], bytes(v.dtype.itemsize * cache.max_numel())).index(idx - idx.vmin))
   return usb_poke_word(link, addr, v)
 
-def usb_load(b:UOp, idx:UOp, ld:UOp) -> UOp:
-  slot, n = usb_stack(ld.dtype), UOp.const(ld.dtype.itemsize, dtypes.int)
-  return slot.after(usb_stream(usb_link(b.device).after(*usb_deps(b)), usb_addr(b, idx, ld.dtype), slot.index(0), n, False)).index(0).load()
+def usb_load(b:UOp, idx:UOp, ld:UOp) -> UOp: # all ones once the link failed, like a dead pcie device, so polls end
+  link, slot, n = usb_link(b.device).after(*usb_deps(b)), usb_stack(ld.dtype), UOp.const(ld.dtype.itemsize, dtypes.int)
+  read = usb_stream(link, usb_addr(b, idx, ld.dtype), slot.index(0), n, False)
+  return link.after(read).index(5).load().ne(0).where(UOp.const(ld.dtype.max, ld.dtype), slot.after(read).index(0).load())
 
 pm_usb_lower = PatternMatcher([
   (UPat.var("dst").index(UPat.var("di")).store(UPat.var("v")).end(UPat(Ops.RANGE, name="r")), usb_copy),
@@ -317,10 +318,15 @@ def usb_reap(link:UOp, xfer:UOp) -> UOp: # poll while pending (0xff), any other 
 
 @uopfunc
 def usb_drain(link:UOp, fence:UOp, need:UOp) -> UOp: # fence == need - 1 or need, mod 256
-  loop, slot = UOp.range(UOp(Ops.NOOP).after(link), next(UOp.unique_num), dtype=dtypes.void), usb_stack(dtypes.uint32, 0)
+  loop, slot = UOp.range(UOp(Ops.NOOP).after(link), next(UOp.unique_num), dtype=dtypes.void), usb_stack(dtypes.uint32, 0, 0, 0)
   read = usb_ctrl(link.after(loop), 0xC0, 0xE4, fence, 0, slot.index(0), 1)
-  lag = (need - slot.after(read).index(0).load().cast(dtypes.uint64)) & 0xff
-  return read.backedge(loop, link.after(read).index(5).load().eq(0) & (lag > 1)).sink()
+  lag, tries = (need - slot.after(read).index(0).load().cast(dtypes.uint64)) & 0xff, slot.after(read).index(1).load()
+  # a stalled fence: check the pcie link, it goes down when the gpu loses power
+  stalled = UOp.range((tries >= 1000).cast(dtypes.int).after(read), next(UOp.unique_num), dtype=dtypes.int)
+  ltssm = usb_ctrl(link.after(stalled), 0xC0, 0xE4, 0xB450, 0, slot.index(2), 1)
+  down = usb_fail(link.after(ltssm), slot.after(ltssm).index(2).load().ne(0x78).cast(dtypes.int) * libusb.LIBUSB_ERROR_NO_DEVICE).end(stalled)
+  counted = slot.after(down).index(1).store(tries + 1)
+  return counted.backedge(loop, link.after(counted).index(5).load().eq(0) & (lag > 1)).sink()
 
 @uopfunc
 def usb_begin(link:UOp, fence:UOp, prev:UOp) -> UOp: # previous batch drained, count restarts
