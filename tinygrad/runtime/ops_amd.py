@@ -815,6 +815,11 @@ class USBIface(PCIIface):
 
   def sleep(self, timeout): pass
 
+  def on_device_hang(self):
+    # a gpu that lost power drops the pcie link, its ih ring is unreadable and walking it over usb takes seconds
+    if self.pci_dev.usb.read(0xB450, 1)[0] != 0x78: raise RuntimeError("Device hang detected, pcie link down")
+    super().on_device_hang()
+
 def _mock(iface, name=None): return type(name or f"MOCK{iface.__name__}", (iface,), {})
 
 class AMDDevice(Compiled):
