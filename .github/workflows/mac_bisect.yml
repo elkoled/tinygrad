@@ -6,7 +6,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sha: [bdf311a6f, f049e6893, 4336844e8, 9adfb7169, d85df1650, 195da3a32]
+        sha: ['a08c6742c']
     steps:
       - uses: actions/checkout@v4
         with:
@@ -18,4 +18,4 @@ jobs:
           python-version: "3.12"
       - run: pip install numpy
       - name: compile openpilot dm warp on metal
-        run: DEV=METAL JIT=2 PYTHONPATH=. python3 examples/openpilot/compile_warp.py --frame 1928,1208,2048,1216,608,4804608 --warp-to 1440x960 --layout luma --border-fill 16 --transform-device NPY --output /tmp/dm_warp.pkl
+        run: DEV=METAL JIT=2 PYTHONFAULTHANDLER=1 DEBUG=2 PYTHONPATH=. python3 examples/openpilot/compile_warp.py --frame 1928,1208,2048,1216,608,4804608 --warp-to 1440x960 --layout luma --border-fill 16 --transform-device NPY --output /tmp/dm_warp.pkl
