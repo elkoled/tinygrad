@@ -7,6 +7,7 @@ jobs:
       fail-fast: false
       matrix:
         sha: ['a08c6742c']
+        jit: ['1', '2', '0']
     steps:
       - uses: actions/checkout@v4
         with:
@@ -18,4 +19,4 @@ jobs:
           python-version: "3.12"
       - run: pip install numpy
       - name: compile openpilot dm warp on metal
-        run: DEV=METAL JIT=2 PYTHONFAULTHANDLER=1 DEBUG=2 PYTHONPATH=. python3 examples/openpilot/compile_warp.py --frame 1928,1208,2048,1216,608,4804608 --warp-to 1440x960 --layout luma --border-fill 16 --transform-device NPY --output /tmp/dm_warp.pkl
+        run: DEV=METAL JIT=${{ matrix.jit }} PYTHONFAULTHANDLER=1 PYTHONPATH=. python3 examples/openpilot/compile_warp.py --frame 1928,1208,2048,1216,608,4804608 --warp-to 1440x960 --layout luma --border-fill 16 --transform-device NPY --output /tmp/dm_warp.pkl
