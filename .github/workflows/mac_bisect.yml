@@ -2,12 +2,13 @@ name: mac bisect
 on: push
 jobs:
   warp:
-    runs-on: macos-15
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         sha: ['a08c6742c']
-        jit: ['1', '2', '0']
+        jit: ['2']
+        os: ['macos-26', 'macos-15', 'macos-latest']
     steps:
       - uses: actions/checkout@v4
         with:
