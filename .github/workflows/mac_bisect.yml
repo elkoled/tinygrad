@@ -6,7 +6,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sha: [9d0446a4b, 62d2c76ce, b7ff6dedf, ad396718a, e9bc9b208, 69843a8ce, 824a9a07f, 8115c245d, 99152ea3c, c3aec477b, 225f6d0ec, a26c50b01, e039d38f7, f20aa695b, 8ea900d1b, a08c6742c]
+        sha: [bdf311a6f, f049e6893, 4336844e8, 9adfb7169, d85df1650, 195da3a32]
     steps:
       - uses: actions/checkout@v4
         with:
