@@ -1,0 +1,21 @@
+name: mac bisect
+on: push
+jobs:
+  warp:
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        sha: [9d0446a4b, 62d2c76ce, b7ff6dedf, ad396718a, e9bc9b208, 69843a8ce, 824a9a07f, 8115c245d, 99152ea3c, c3aec477b, 225f6d0ec, a26c50b01, e039d38f7, f20aa695b, 8ea900d1b, a08c6742c]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: tinygrad/tinygrad
+          fetch-depth: 0
+      - run: git checkout ${{ matrix.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy
+      - name: compile openpilot dm warp on metal
+        run: DEV=METAL JIT=2 PYTHONPATH=. python3 examples/openpilot/compile_warp.py --frame 1928,1208,2048,1216,608,4804608 --warp-to 1440x960 --layout luma --border-fill 16 --transform-device NPY --output /tmp/dm_warp.pkl
